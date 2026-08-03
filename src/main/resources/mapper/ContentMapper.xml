@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="post.mapper.ContentMapper">
+
+    <insert id="insert" parameterType="post.model.Content" useGeneratedKeys="true" keyProperty="contentId" keyColumn="content_id">
+        INSERT INTO contents (post_id, version, content)
+        VALUES (#{postId}, #{version}, #{content})
+    </insert>
+
+    <update id="update">
+        UPDATE contents
+        SET content = #{content}
+        WHERE post_id = #{postId}
+          AND version = #{version}
+    </update>
+
+    <select id="selectContentByPost" resultType="post.model.Content">
+        SELECT content_id, post_id, version, content
+        FROM contents
+        WHERE post_id = #{postId}
+          AND version = #{version}
+          LIMIT 1
+    </select>
+
+    <select id="selectContent" resultType="post.model.Content">
+        SELECT content_id, post_id, version, content
+        FROM contents
+        WHERE post_id = #{postId}
+          AND version = #{version}
+          LIMIT 1
+    </select>
+</mapper>

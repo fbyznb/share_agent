@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="post.mapper.PostMapper">
+
+    <insert id="insert" parameterType="post.model.Post" useGeneratedKeys="true" keyProperty="postId" keyColumn="post_id">
+        INSERT INTO posts (user_id, title, status, version)
+        VALUES (#{userId}, #{title}, #{status}, #{version})
+    </insert>
+
+    <update id="update">
+        UPDATE posts
+        SET status = status + 1
+        WHERE post_id = #{postId}
+          AND status = #{status}
+          AND version = #{version}
+    </update>
+
+    <select id="select" resultType="post.model.Post">
+        SELECT post_id, user_id, title, status, version
+        FROM posts
+        WHERE post_id = #{postId} AND status IN (2,3)
+    </select>
+
+    <select id="selectTitlesByUserId" resultType="java.lang.String">
+        SELECT title
+        FROM posts
+        WHERE user_id = #{userId}
+        ORDER BY post_id
+    </select>
+
+    <!-- 更新帖子的版本号（自增）和状态 -->
+    <update id="publishVersion">
+        UPDATE posts
+        SET version = version + 1,
+            status = 2
+        WHERE post_id = #{postId}
+          AND version = #{version}
+    </update>
+
+    <!-- 根据帖子ID查询当前版本号和状态 -->
+    <select id="selectVersionAndStatus" resultType="post.model.Post">
+        SELECT version, status
+        FROM posts
+        WHERE post_id = #{postId}
+    </select>
+</mapper>
