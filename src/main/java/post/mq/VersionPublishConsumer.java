@@ -11,14 +11,11 @@ import org.apache.rocketmq.spring.core.RocketMQListener;
 import org.redisson.api.RBloomFilter;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
-import java.util.ArrayList;
 import java.util.List;
 
 
@@ -35,7 +32,6 @@ import java.util.List;
 )
 public class VersionPublishConsumer implements RocketMQListener<Pav> {
 
-    private static final Logger logger = LoggerFactory.getLogger(VersionPublishConsumer.class);
     private static final DefaultRedisScript<Long> PUBLISH_CACHE_LUA =
             new DefaultRedisScript<>("""
                     local publishVersion = tonumber(ARGV[1])
@@ -53,6 +49,8 @@ public class VersionPublishConsumer implements RocketMQListener<Pav> {
 
     @Autowired
     private RedissonClient redissonClient;
+    @Autowired
+    private RBloomFilter<Long> postsBloomFilter;
     @Autowired
     private PostMapper postMapper;
     @Autowired
@@ -79,12 +77,10 @@ public class VersionPublishConsumer implements RocketMQListener<Pav> {
             if (content != null) {
                 chatService.saveVectorStore(content.getContent(),pav.version+1,pav.postId);
             }
-            postMapper.publishVersion(pav.postId, pav.version);
             if(post.getStatus() == 1){
-                RBloomFilter<Long> postsBloomFilter =
-                    redissonClient.getBloomFilter("bloom:posts");
                 postsBloomFilter.add(pav.postId);
             }
+            postMapper.publishVersion(pav.postId, pav.version);
             int publishedVersion = pav.version + 1;
             stringRedisTemplate.execute(
                     PUBLISH_CACHE_LUA,

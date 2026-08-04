@@ -1,7 +1,6 @@
 package post.service;
 
 import post.controller.dto.UpdateResponse;
-import post.model.Post;
 import post.controller.dto.InsertResponse;
 import post.controller.dto.SelectResponse;
 

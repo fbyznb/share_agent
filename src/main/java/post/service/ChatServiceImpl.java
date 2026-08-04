@@ -2,23 +2,42 @@ package post.service;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.SignalType;
 
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.SystemMessage;
+import org.springframework.ai.chat.messages.ToolResponseMessage;
+import org.springframework.ai.chat.messages.UserMessage;
+import org.springframework.ai.chat.model.ChatModel;
+import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
+import org.springframework.ai.model.tool.ToolCallingManager;
+import org.springframework.ai.model.tool.ToolExecutionResult;
+import org.springframework.ai.support.ToolCallbacks;
+import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.jdbc.support.GeneratedKeyHolder;
+import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import java.sql.PreparedStatement;
+import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.extern.slf4j.Slf4j;
 
@@ -216,6 +235,7 @@ public class ChatServiceImpl implements ChatService {
             5. top_k 始终为 2。
             """;
 
+    @SuppressWarnings("unused")
     private static final String ARTICLE_SEARCH_QUERY_GENERATOR_SYSTEM_PROMPT = """
             你是知识社区文章检索查询生成器。
 
@@ -256,6 +276,7 @@ public class ChatServiceImpl implements ChatService {
              }
             """;
 
+    @SuppressWarnings("unused")
     private static final String REACT_DECISION_CONTROLLER_SYSTEM_PROMPT = """
             你是一个 ReAct 智能体中的“思考与决策控制器”。
 
@@ -807,11 +828,33 @@ public class ChatServiceImpl implements ChatService {
 
             """;
 
+    private static final String NATIVE_REACT_CONTROLLER_SYSTEM_PROMPT = """
+            你是知识社区 ReAct 智能体的决策控制器。
+            输入是后端维护的完整 AgentState。你只负责判断证据是否充分，不直接回答用户。
+
+            决策规则：
+            1. 只有缺少的信息能由已注册工具获得，并且结果会明显改善答案时，才调用工具。
+            2. 每轮最多调用一个工具；查询必须具体，不得重复 used_tool_calls 或已有 evidences。
+            3. search_article_chunks 用于检索当前文章原文；get_author_articles 仅用于查询当前文章作者的作品列表。
+            4. 不得把长期记忆当作已验证的外部事实。
+            5. 工具参数中的查询只描述缺失证据，不得包含最终答案。
+            6. 需要工具时必须发起模型原生工具调用，不得输出 TOOL_CALL JSON。
+            7. 不需要工具时只输出以下三种合法 JSON 之一，不得输出 Markdown、解释或答案正文：
+
+            {"next_action":"FINAL_ANSWER","user_question":null}
+            {"next_action":"ASK_USER","user_question":"一个简短、具体且必须由用户回答的问题"}
+            {"next_action":"STOP","user_question":null}
+
+            只有缺少的信息必须由用户本人提供且工具、上下文和合理假设都无法获得时，才使用 ASK_USER。
+            已有信息足以回答或继续调用工具价值很低时使用 FINAL_ANSWER。
+            达到输入状态中的限制时使用 STOP。
+            """;
+
     private static final String FINAL_ANSWER_SYSTEM_PROMPT = """
             你是知识社区问答助手。请根据给定的完整 AgentState 回答用户问题。
             优先回答 independent_question，并结合 conversation_memory 理解上下文。
-            long_term_memory 仅用于个性化背景；evidences 才是文章检索得到的事实依据。
-            不得编造证据中不存在的文章内容。证据不足时应明确说明限制，并给出可执行的最佳努力答案。
+            long_term_memory 仅用于个性化背景；evidences 是工具返回的事实依据，可能来自文章原文或作者作品列表。
+            不得编造证据中不存在的文章内容或作者信息。证据不足时应明确说明限制，并给出可执行的最佳努力答案。
             直接输出面向用户的最终答案，不要输出 AgentState、内部状态、思维链或 JSON。
             """;
 
@@ -820,6 +863,12 @@ public class ChatServiceImpl implements ChatService {
     
     @Autowired
     private ChatClient chatClient;
+
+    @Autowired
+    private ChatModel chatModel;
+
+    @Autowired
+    private ToolCallingManager toolCallingManager;
 
     @Autowired
     private SummarizingWindowChatMemory chatMemory;
@@ -843,15 +892,40 @@ public class ChatServiceImpl implements ChatService {
     private AuthorArticlesTool authorArticlesTool;
 
     @Override
+    @Transactional(rollbackFor = Exception.class)
+    public Long createConversation(Long userId, Long postId) {
+        if (userId == null || postId == null) {
+            throw new IllegalArgumentException("userId 和 postId 不能为空");
+        }
+        if (postMapper.select(postId) == null) {
+            throw new IllegalArgumentException("文章不存在: " + postId);
+        }
+
+        KeyHolder keyHolder = new GeneratedKeyHolder();
+        jdbcTemplate.update(connection -> {
+            PreparedStatement statement = connection.prepareStatement(
+                    "insert into `chat` (user_id, post_id) values (?, ?)",
+                    Statement.RETURN_GENERATED_KEYS
+            );
+            statement.setLong(1, userId);
+            statement.setLong(2, postId);
+            return statement;
+        }, keyHolder);
+
+        Number conversationId = keyHolder.getKey();
+        if (conversationId == null) {
+            throw new IllegalStateException("数据库未返回会话 ID");
+        }
+        return conversationId.longValue();
+    }
+
+    @Override
     public Flux<String> chat(
             Long userId,
             Long conversationId,
-            Long taskId,
             String question,
             Long postId,
-            Integer version,
-            Integer topK,
-            Integer maxTokens
+            Integer version
     ) {
         List<Message> conversationMemory = chatMemory.get(String.valueOf(conversationId));
         Post post = postMapper.select(postId);
@@ -916,64 +990,101 @@ public class ChatServiceImpl implements ChatService {
         longMemoryMessages.add(new Message(conversationId, version, "user", question));
         rocketMQTemplate.syncSend("get_long_memory", longMemoryMessages);
 
-        List<String> articleRagResults = new ArrayList<>();
-        if (memoryRetrievalPlan.articleSearchNeeded()) {
-            String exactMemoryContext = exactLongMemories.isEmpty()
-                    ? "（无精确长期记忆）"
-                    : String.join("\n", exactLongMemories.stream()
-                            .map(memory -> memory.memoryKey() + ": " + memory.content())
-                            .toList());
-            String vectorMemoryContext = vectorLongMemories.isEmpty()
-                    ? "（无语义长期记忆）"
-                    : String.join("\n", vectorLongMemories.stream()
-                            .map(document -> document.getMetadata().get("memoryKey")
-                                    + ": " + document.getText())
-                            .toList());
-            String articleSearchUserPrompt = """
-                    <independent-question>
-                    %s
-                    </independent-question>
-                    <conversation-history>
-                    %s
-                    </conversation-history>
-                    <exact-long-memory>
-                    %s
-                    </exact-long-memory>
-                    <vector-long-memory>
-                    %s
-                    </vector-long-memory>
-                    """.formatted(
-                    independentQuestion,
-                    conversation,
-                    exactMemoryContext,
-                    vectorMemoryContext
-            );
+        String exactMemoryContext = exactLongMemories.isEmpty()
+                ? "（无精确长期记忆）"
+                : String.join("\n", exactLongMemories.stream()
+                        .map(memory -> memory.memoryKey() + ": " + memory.content())
+                        .toList());
+        String vectorMemoryContext = vectorLongMemories.isEmpty()
+                ? "（无语义长期记忆）"
+                : String.join("\n", vectorLongMemories.stream()
+                        .map(document -> document.getMetadata().get("memoryKey")
+                                + ": " + document.getText())
+                        .toList());
+        String articleSearchContext = """
+                <independent-question>
+                %s
+                </independent-question>
+                <conversation-history>
+                %s
+                </conversation-history>
+                <exact-long-memory>
+                %s
+                </exact-long-memory>
+                <vector-long-memory>
+                %s
+                </vector-long-memory>
+                """.formatted(
+                independentQuestion,
+                conversation,
+                exactMemoryContext,
+                vectorMemoryContext
+        );
 
-            List<ConversationMemoryItem> conversationItems = conversationMemory.stream()
-                    .map(message -> new ConversationMemoryItem(message.getRole(), message.getContent()))
-                    .toList();
-            List<LongMemoryItem> exactMemoryItems = exactLongMemories.stream()
-                    .map(memory -> new LongMemoryItem(memory.memoryKey(), memory.content(), null))
-                    .toList();
-            List<LongMemoryItem> semanticMemoryItems = vectorLongMemories.stream()
-                    .map(document -> new LongMemoryItem(
-                            String.valueOf(document.getMetadata().get("memoryKey")),
-                            document.getText(),
-                            document.getScore()
-                    ))
-                    .toList();
-        
-            List<String> usedQueries = new ArrayList<>();
-            List<String> visitedChunkIds = new ArrayList<>();
-            String status = "RUNNING";
-            String stopReason = null;
-            String userQuestion = null;
-            int iteration = 0;
-            int toolCallCount = 0;
-            int consecutiveNoNewEvidence = 0;
+        List<ConversationMemoryItem> conversationItems = conversationMemory.stream()
+                .map(message -> new ConversationMemoryItem(message.getRole(), message.getContent()))
+                .toList();
+        List<LongMemoryItem> exactMemoryItems = exactLongMemories.stream()
+                .map(memory -> new LongMemoryItem(memory.memoryKey(), memory.content(), null))
+                .toList();
+        List<LongMemoryItem> semanticMemoryItems = vectorLongMemories.stream()
+                .map(document -> new LongMemoryItem(
+                        String.valueOf(document.getMetadata().get("memoryKey")),
+                        document.getText(),
+                        document.getScore()
+                ))
+                .toList();
 
-            while ("RUNNING".equals(status)) {
-                // 硬限制由后端判断，不能依赖模型自报的 state_patch。
+        List<Evidence> evidences = new ArrayList<>();
+        Set<String> usedToolCalls = new HashSet<>();
+        Set<String> visitedEvidenceIds = new HashSet<>();
+        String status = "RUNNING";
+        String stopReason = null;
+        String userQuestion = null;
+        int iteration = 0;
+        int toolCallCount = 0;
+        int consecutiveNoNewEvidence = 0;
+
+        ToolCallback[] toolCallbacks = memoryRetrievalPlan.articleSearchNeeded()
+                ? ToolCallbacks.from(articleSearchTool, authorArticlesTool)
+                : ToolCallbacks.from(authorArticlesTool);
+        Integer effectiveVersion = version == null ? post.getVersion() : version;
+        ToolCallingChatOptions toolOptions = ToolCallingChatOptions.builder()
+                .toolCallbacks(toolCallbacks)
+                .toolContext(Map.of(
+                        ArticleSearchTool.POST_ID_CONTEXT_KEY, postId,
+                        ArticleSearchTool.VERSION_CONTEXT_KEY, effectiveVersion,
+                        ArticleSearchTool.SEARCH_CONTEXT_KEY, articleSearchContext,
+                        AuthorArticlesTool.AUTHOR_ID_CONTEXT_KEY, post.getUserId()
+                ))
+                .internalToolExecutionEnabled(false)
+                .build();
+
+        AgentState currentState = buildAgentState(
+                question,
+                independentQuestion,
+                conversationItems,
+                exactMemoryItems,
+                semanticMemoryItems,
+                status,
+                iteration,
+                toolCallCount,
+                usedToolCalls,
+                visitedEvidenceIds,
+                consecutiveNoNewEvidence,
+                stopReason,
+                evidences
+        );
+        Prompt reactPrompt = new Prompt(
+                List.of(
+                        new SystemMessage(NATIVE_REACT_CONTROLLER_SYSTEM_PROMPT),
+                        new UserMessage(toJson(currentState))
+                ),
+                toolOptions
+        );
+
+        while ("RUNNING".equals(status)) {
+                // 硬限制只由后端状态判断，模型不能绕过。
                 if (iteration >= MAX_REACT_ITERATIONS
                         || toolCallCount >= MAX_REACT_TOOL_CALLS
                         || consecutiveNoNewEvidence >= MAX_CONSECUTIVE_NO_NEW_EVIDENCE) {
@@ -982,33 +1093,91 @@ public class ChatServiceImpl implements ChatService {
                     break;
                 }
 
-                AgentState agentState = new AgentState(
-                        question,
-                        independentQuestion,
-                        conversationItems,
-                        new LongTermMemoryState(exactMemoryItems, semanticMemoryItems),
-                        new ReactControl(
-                                status,
-                                iteration,
-                                MAX_REACT_ITERATIONS,
-                                toolCallCount,
-                                MAX_REACT_TOOL_CALLS,
-                                List.copyOf(usedQueries),
-                                List.copyOf(visitedChunkIds),
-                                consecutiveNoNewEvidence,
-                                stopReason
-                        ),
-                        List.copyOf(articleRagResults)
-                );
-
-                ReactDecision decision = chatClient.prompt()
-                        .system(REACT_DECISION_CONTROLLER_SYSTEM_PROMPT)
-                        .user(toJson(agentState))
-                        .tools(articleSearchTool)
-                        .call()
-                        .entity(ReactDecision.class);
+                ChatResponse response;
+                try {
+                    response = chatModel.call(reactPrompt);
+                } catch (RuntimeException exception) {
+                    log.error("ReAct 决策调用失败，postId={}，version={}", postId, effectiveVersion, exception);
+                    status = "FAILED";
+                    stopReason = "ERROR";
+                    break;
+                }
                 iteration++;
 
+                if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+                    status = "FAILED";
+                    stopReason = "ERROR";
+                    break;
+                }
+
+                if (response.hasToolCalls()) {
+                    List<org.springframework.ai.chat.messages.AssistantMessage.ToolCall> toolCalls =
+                            response.getResult().getOutput().getToolCalls();
+                    ToolCallValidation validation = validateToolCall(
+                            toolCalls,
+                            toolCallCount,
+                            usedToolCalls
+                    );
+                    if (!validation.accepted()) {
+                        status = "FAILED";
+                        stopReason = validation.stopReason();
+                        break;
+                    }
+
+                    org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall =
+                            validation.toolCall();
+                    usedToolCalls.add(validation.toolCallKey());
+
+                    ToolExecutionResult executionResult;
+                    try {
+                        executionResult = toolCallingManager.executeToolCalls(reactPrompt, response);
+                        toolCallCount++;
+                    } catch (RuntimeException exception) {
+                        log.error("ReAct 工具调用失败，toolName={}，postId={}，version={}",
+                                toolCall.name(), postId, effectiveVersion, exception);
+                        status = "FAILED";
+                        stopReason = "ERROR";
+                        break;
+                    }
+
+                    int newEvidenceCount = appendToolEvidences(
+                            executionResult,
+                            visitedEvidenceIds,
+                            evidences
+                    );
+                    consecutiveNoNewEvidence = newEvidenceCount == 0
+                            ? consecutiveNoNewEvidence + 1
+                            : 0;
+
+                    currentState = buildAgentState(
+                            question,
+                            independentQuestion,
+                            conversationItems,
+                            exactMemoryItems,
+                            semanticMemoryItems,
+                            status,
+                            iteration,
+                            toolCallCount,
+                            usedToolCalls,
+                            visitedEvidenceIds,
+                            consecutiveNoNewEvidence,
+                            stopReason,
+                            evidences
+                    );
+                    List<org.springframework.ai.chat.messages.Message> nextMessages =
+                            new ArrayList<>(executionResult.conversationHistory());
+                    nextMessages.add(new UserMessage("""
+                            <agent-state-update>
+                            %s
+                            </agent-state-update>
+                            """.formatted(toJson(currentState))));
+                    reactPrompt = new Prompt(nextMessages, toolOptions);
+                    continue;
+                }
+
+                TerminalDecision decision = parseTerminalDecision(
+                        response.getResult().getOutput().getText()
+                );
                 if (decision == null || decision.nextAction() == null) {
                     status = "FAILED";
                     stopReason = "ERROR";
@@ -1025,81 +1194,9 @@ public class ChatServiceImpl implements ChatService {
                         stopReason = "NEED_USER_INPUT";
                         userQuestion = decision.userQuestion();
                     }
-                    case "STOP", "NO_OP" -> {
+                    case "STOP" -> {
                         status = "FAILED";
                         stopReason = "LIMIT_REACHED";
-                    }
-                    case "TOOL_CALL" -> {
-                        ToolRequest toolRequest = decision.toolRequest();
-                        if (toolRequest == null
-                                || toolRequest.query() == null
-                                || toolRequest.query().isBlank()
-                                || usedQueries.contains(toolRequest.query())) {
-                            status = "FAILED";
-                            stopReason = "ERROR";
-                            break;
-                        }
-
-                        ArticleSearchPlan searchPlan = chatClient.prompt()
-                                .system(ARTICLE_SEARCH_QUERY_GENERATOR_SYSTEM_PROMPT)
-                                .user(articleSearchUserPrompt + """
-
-                                        <missing-evidence-query>
-                                        %s
-                                        </missing-evidence-query>
-                                        """.formatted(toolRequest.query()))
-                                .call()
-                                .entity(ArticleSearchPlan.class);
-
-                        if (searchPlan == null
-                                || !searchPlan.needed()
-                                || searchPlan.semanticQuery() == null
-                                || searchPlan.semanticQuery().isBlank()) {
-                            status = "FAILED";
-                            stopReason = "ERROR";
-                            break;
-                        }
-
-                        String keywords = searchPlan.keywords() == null
-                                ? ""
-                                : String.join(" ", searchPlan.keywords());
-                        if (keywords.isBlank()) {
-                            keywords = toolRequest.query();
-                        }
-
-                        List<String> toolResults;
-                        try {
-                            toolResults = articleSearchTool.searchArticleChunks(
-                                    postId,
-                                    version,
-                                    searchPlan.semanticQuery(),
-                                    keywords
-                            );
-                            usedQueries.add(toolRequest.query());
-                            toolCallCount++;
-                        } catch (RuntimeException exception) {
-                            log.error("文章 RAG 工具调用失败，postId={}，version={}", postId, version, exception);
-                            status = "FAILED";
-                            stopReason = "ERROR";
-                            break;
-                        }
-                        int newEvidenceCount = 0;
-                        for (String content : toolResults == null ? List.<String>of() : toolResults) {
-                            if (content == null || content.isBlank()) {
-                                continue;
-                            }
-                            String chunkId = postId + "@" + version + "#"
-                                    + Integer.toUnsignedString(content.hashCode(), 16);
-                            if (visitedChunkIds.contains(chunkId)) {
-                                continue;
-                            }
-                            visitedChunkIds.add(chunkId);
-                            articleRagResults.add(toJson(new Evidence(chunkId, content)));
-                            newEvidenceCount++;
-                        }
-                        consecutiveNoNewEvidence = newEvidenceCount == 0
-                                ? consecutiveNoNewEvidence + 1
-                                : 0;
                     }
                     default -> {
                         status = "FAILED";
@@ -1108,77 +1205,31 @@ public class ChatServiceImpl implements ChatService {
                 }
             }
 
-            AgentState finalState = new AgentState(
-                    question,
-                    independentQuestion,
-                    conversationItems,
-                    new LongTermMemoryState(exactMemoryItems, semanticMemoryItems),
-                    new ReactControl(
-                            status,
-                            iteration,
-                            MAX_REACT_ITERATIONS,
-                            toolCallCount,
-                            MAX_REACT_TOOL_CALLS,
-                            List.copyOf(usedQueries),
-                            List.copyOf(visitedChunkIds),
-                            consecutiveNoNewEvidence,
-                            stopReason
-                    ),
-                    List.copyOf(articleRagResults)
-            );
-            if ("NEED_USER_INPUT".equals(stopReason)
-                    && userQuestion != null
-                    && !userQuestion.isBlank()) {
-                return saveConversation(
-                        Flux.just(userQuestion),
-                        conversationId,
-                        version,
-                        question
-                );
-            }
+        AgentState finalState = buildAgentState(
+                question,
+                independentQuestion,
+                conversationItems,
+                exactMemoryItems,
+                semanticMemoryItems,
+                status,
+                iteration,
+                toolCallCount,
+                usedToolCalls,
+                visitedEvidenceIds,
+                consecutiveNoNewEvidence,
+                stopReason,
+                evidences
+        );
+        if ("NEED_USER_INPUT".equals(stopReason)
+                && userQuestion != null
+                && !userQuestion.isBlank()) {
             return saveConversation(
-                    chatClient.prompt()
-                            .system(FINAL_ANSWER_SYSTEM_PROMPT)
-                            .user(toJson(finalState))
-                            .stream()
-                            .content(),
+                    Flux.just(userQuestion),
                     conversationId,
-                    version,
+                    effectiveVersion,
                     question
             );
         }
-
-        AgentState finalState = new AgentState(
-                question,
-                independentQuestion,
-                conversationMemory.stream()
-                        .map(message -> new ConversationMemoryItem(message.getRole(), message.getContent()))
-                        .toList(),
-                new LongTermMemoryState(
-                        exactLongMemories.stream()
-                                .map(memory -> new LongMemoryItem(memory.memoryKey(), memory.content(), null))
-                                .toList(),
-                        vectorLongMemories.stream()
-                                .map(document -> new LongMemoryItem(
-                                        String.valueOf(document.getMetadata().get("memoryKey")),
-                                        document.getText(),
-                                        document.getScore()
-                                ))
-                                .toList()
-                ),
-                new ReactControl(
-                        "COMPLETED",
-                        0,
-                        MAX_REACT_ITERATIONS,
-                        0,
-                        MAX_REACT_TOOL_CALLS,
-                        List.of(),
-                        List.of(),
-                        0,
-                        "FINAL_ANSWER"
-                ),
-                List.of()
-        );
         return saveConversation(
                 chatClient.prompt()
                         .system(FINAL_ANSWER_SYSTEM_PROMPT)
@@ -1186,7 +1237,7 @@ public class ChatServiceImpl implements ChatService {
                         .stream()
                         .content(),
                 conversationId,
-                version,
+                effectiveVersion,
                 question
         );
     }
@@ -1351,6 +1402,153 @@ public class ChatServiceImpl implements ChatService {
         }
     }
 
+    private AgentState buildAgentState(
+            String originalQuestion,
+            String independentQuestion,
+            List<ConversationMemoryItem> conversationItems,
+            List<LongMemoryItem> exactMemoryItems,
+            List<LongMemoryItem> semanticMemoryItems,
+            String status,
+            int iteration,
+            int toolCallCount,
+            Set<String> usedToolCalls,
+            Set<String> visitedEvidenceIds,
+            int consecutiveNoNewEvidence,
+            String stopReason,
+            List<Evidence> evidences
+    ) {
+        return new AgentState(
+                originalQuestion,
+                independentQuestion,
+                conversationItems,
+                new LongTermMemoryState(exactMemoryItems, semanticMemoryItems),
+                new ReactControl(
+                        status,
+                        iteration,
+                        MAX_REACT_ITERATIONS,
+                        toolCallCount,
+                        MAX_REACT_TOOL_CALLS,
+                        List.copyOf(usedToolCalls),
+                        List.copyOf(visitedEvidenceIds),
+                        consecutiveNoNewEvidence,
+                        stopReason
+                ),
+                List.copyOf(evidences)
+        );
+    }
+
+    private ToolCallValidation validateToolCall(
+            List<org.springframework.ai.chat.messages.AssistantMessage.ToolCall> toolCalls,
+            int toolCallCount,
+            Set<String> usedToolCalls
+    ) {
+        if (toolCalls == null
+                || toolCalls.size() != 1
+                || toolCallCount >= MAX_REACT_TOOL_CALLS) {
+            return new ToolCallValidation(null, null, "LIMIT_REACHED");
+        }
+        org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall = toolCalls.get(0);
+        String toolCallKey = canonicalToolCallKey(toolCall.name(), toolCall.arguments());
+        if (usedToolCalls.contains(toolCallKey)) {
+            return new ToolCallValidation(null, null, "ERROR");
+        }
+        return new ToolCallValidation(toolCall, toolCallKey, null);
+    }
+
+    private String canonicalToolCallKey(String toolName, String arguments) {
+        String canonicalArguments = arguments == null ? "" : arguments;
+        if (arguments != null && !arguments.isBlank()) {
+            try {
+                canonicalArguments = objectMapper.writeValueAsString(objectMapper.readTree(arguments));
+            } catch (JsonProcessingException exception) {
+                log.warn("工具参数不是合法 JSON，将使用原始参数进行去重，toolName={}", toolName);
+            }
+        }
+        return toolName + ":" + canonicalArguments;
+    }
+
+    private int appendToolEvidences(
+            ToolExecutionResult executionResult,
+            Set<String> visitedEvidenceIds,
+            List<Evidence> evidences
+    ) {
+        int added = 0;
+        for (org.springframework.ai.chat.messages.Message message : executionResult.conversationHistory()) {
+            if (!(message instanceof ToolResponseMessage toolResponseMessage)) {
+                continue;
+            }
+            for (ToolResponseMessage.ToolResponse response : toolResponseMessage.getResponses()) {
+                String responseData = response.responseData();
+                if (responseData == null || responseData.isBlank()) {
+                    continue;
+                }
+                try {
+                    JsonNode root = objectMapper.readTree(responseData);
+                    if (root.isArray()) {
+                        for (JsonNode item : root) {
+                            added += addEvidence(
+                                    response.name(),
+                                    item.isTextual() ? item.asText() : item.toString(),
+                                    visitedEvidenceIds,
+                                    evidences
+                            );
+                        }
+                    } else {
+                        added += addEvidence(
+                                response.name(),
+                                root.isTextual() ? root.asText() : root.toString(),
+                                visitedEvidenceIds,
+                                evidences
+                        );
+                    }
+                } catch (JsonProcessingException exception) {
+                    added += addEvidence(
+                            response.name(),
+                            responseData,
+                            visitedEvidenceIds,
+                            evidences
+                    );
+                }
+            }
+        }
+        return added;
+    }
+
+    private static int addEvidence(
+            String toolName,
+            String content,
+            Set<String> visitedEvidenceIds,
+            List<Evidence> evidences
+    ) {
+        if (content == null || content.isBlank()) {
+            return 0;
+        }
+        String evidenceId = toolName + "#"
+                + Integer.toUnsignedString((toolName + "\0" + content).hashCode(), 16);
+        if (!visitedEvidenceIds.add(evidenceId)) {
+            return 0;
+        }
+        evidences.add(new Evidence(evidenceId, toolName, content));
+        return 1;
+    }
+
+    private TerminalDecision parseTerminalDecision(String content) {
+        if (content == null || content.isBlank()) {
+            return null;
+        }
+        String json = content.trim();
+        if (json.startsWith("```")) {
+            json = json.replaceFirst("^```(?:json)?\\s*", "")
+                    .replaceFirst("\\s*```$", "");
+        }
+        try {
+            return objectMapper.readValue(json, TerminalDecision.class);
+        } catch (JsonProcessingException exception) {
+            log.warn("ReAct 终态决策无法解析: {}", content);
+            return null;
+        }
+    }
+
     private Flux<String> saveConversation(
             Flux<String> response,
             Long conversationId,
@@ -1380,7 +1578,7 @@ public class ChatServiceImpl implements ChatService {
             @JsonProperty("conversation_memory") List<ConversationMemoryItem> conversationMemory,
             @JsonProperty("long_term_memory") LongTermMemoryState longTermMemory,
             @JsonProperty("react_control") ReactControl reactControl,
-            List<String> evidences
+            List<Evidence> evidences
     ) {
     }
 
@@ -1406,37 +1604,32 @@ public class ChatServiceImpl implements ChatService {
             @JsonProperty("max_iterations") int maxIterations,
             @JsonProperty("tool_call_count") int toolCallCount,
             @JsonProperty("max_tool_calls") int maxToolCalls,
-            @JsonProperty("used_queries") List<String> usedQueries,
-            @JsonProperty("visited_chunk_ids") List<String> visitedChunkIds,
+            @JsonProperty("used_tool_calls") List<String> usedToolCalls,
+            @JsonProperty("visited_evidence_ids") List<String> visitedEvidenceIds,
             @JsonProperty("consecutive_no_new_evidence") int consecutiveNoNewEvidence,
             @JsonProperty("stop_reason") String stopReason
     ) {
     }
 
-    private record ReactDecision(
-            @JsonProperty("thought_summary") String thoughtSummary,
-            @JsonProperty("evidence_sufficient") boolean evidenceSufficient,
+    private record TerminalDecision(
             @JsonProperty("next_action") String nextAction,
-            @JsonProperty("tool_request") ToolRequest toolRequest,
-            @JsonProperty("user_question") String userQuestion,
-            @JsonProperty("state_patch") StatePatch statePatch
+            @JsonProperty("user_question") String userQuestion
     ) {
     }
 
-    private record ToolRequest(
-            String query,
-            String purpose,
-            @JsonProperty("exclude_chunk_ids") List<String> excludeChunkIds
+    private record ToolCallValidation(
+            org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall,
+            String toolCallKey,
+            String stopReason
     ) {
-    }
-
-    private record StatePatch(
-            @JsonProperty("react_control") ReactControl reactControl
-    ) {
+        private boolean accepted() {
+            return toolCall != null;
+        }
     }
 
     private record Evidence(
-            @JsonProperty("chunk_id") String chunkId,
+            @JsonProperty("evidence_id") String evidenceId,
+            @JsonProperty("tool_name") String toolName,
             String content
     ) {
     }
@@ -1467,13 +1660,6 @@ public class ChatServiceImpl implements ChatService {
             boolean needed,
             String query,
             @JsonProperty("top_k") int topK
-    ) {
-    }
-
-    private record ArticleSearchPlan(
-            boolean needed,
-            @JsonProperty("semantic_query") String semanticQuery,
-            List<String> keywords
     ) {
     }
 

@@ -4,6 +4,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.ai.chat.client.advisor.SimpleLoggerAdvisor;
+import org.springframework.ai.model.tool.ToolCallingManager;
 
 import post.memory.DatabaseChatMemoryRepository;
 import post.memory.SummarizingWindowChatMemory;
@@ -16,6 +17,11 @@ public class SpringAIConfig {
         return chatClientBuilder
                 .defaultAdvisors(new SimpleLoggerAdvisor())
                 .build();
+    }
+
+    @Bean
+    public ToolCallingManager toolCallingManager() {
+        return ToolCallingManager.builder().build();
     }
 
     @Bean

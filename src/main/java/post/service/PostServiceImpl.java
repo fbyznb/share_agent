@@ -64,6 +64,8 @@ public class PostServiceImpl implements PostService {
     @Autowired
     private RedissonClient redissonClient;
     @Autowired
+    private RBloomFilter<Long> postsBloomFilter;
+    @Autowired
     private StringRedisTemplate stringRedisTemplate;
     @Autowired
     private ObjectMapper objectMapper;
@@ -127,8 +129,6 @@ public class PostServiceImpl implements PostService {
         if (postId == null) {
             return null;
         }
-        RBloomFilter<Long> postsBloomFilter =
-                redissonClient.getBloomFilter("bloom:posts");
         if (!postsBloomFilter.contains(postId)) {
             return null;
         }

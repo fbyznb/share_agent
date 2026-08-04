@@ -2,6 +2,7 @@ package post.controller;
 
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
@@ -56,14 +57,18 @@ public class PostController {
 
     @GetMapping(path = "/chat")
     public Flux<String> chat(
-            @RequestParam("userId") long userId,
-            @RequestParam("sessionId") long sessionId,
-            @RequestParam("taskId") long taskId,
-            @RequestParam("postId") long postId,
-            @RequestParam("version") Integer version,
+            @RequestParam("userId") Long userId,
+            @RequestParam("conversationId") Long conversationId,
             @RequestParam("question") String question,
-            @RequestParam(value = "topK", defaultValue = "5") int topK,
-            @RequestParam(value = "maxTokens", defaultValue = "1024") int maxTokens) {
-        return chatService.chat(userId, sessionId, taskId, question, postId, version, topK, maxTokens);
+            @RequestParam("postId") Long postId,
+            @RequestParam("version") Integer version) {
+        return chatService.chat(userId, conversationId, question, postId, version);
+    }
+
+    @PostMapping(path = "/createConversation")
+    public Long createConversation(
+            @RequestParam("userId") Long userId,
+            @RequestParam("postId") Long postId) {
+        return chatService.createConversation(userId, postId);
     }
 }
