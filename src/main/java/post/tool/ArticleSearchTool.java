@@ -252,7 +252,7 @@ public class ArticleSearchTool {
             if (chunkIndex != null) {
                 Document previous = selectedChunksByIndex.get(chunkIndex - 1);
                 if (previous != null) {
-                    text = removePrefixOverlap(previous.getText(), text, 100);
+                    text = removeStoredSourceOverlap(previous, document);
                 }
             }
             results.add(text);
@@ -313,6 +313,38 @@ public class ArticleSearchTool {
         } catch (NumberFormatException ignored) {
             return null;
         }
+    }
+
+    private static String removeStoredSourceOverlap(Document previous, Document current) {
+        String currentText = current.getText();
+        Integer previousEnd = metadataInteger(previous, "sourceEnd");
+        Integer currentStart = metadataInteger(current, "sourceStart");
+        if (previousEnd == null || currentStart == null) {
+            // Chunks written by the legacy 800/100-character splitter do not carry
+            // source offsets, so retain its content-based compatibility behavior.
+            return removePrefixOverlap(previous.getText(), currentText, 100);
+        }
+
+        int overlapLength = Math.max(0, previousEnd - currentStart);
+        if (overlapLength == 0) {
+            return currentText;
+        }
+        return currentText.substring(Math.min(overlapLength, currentText.length()));
+    }
+
+    private static Integer metadataInteger(Document document, String key) {
+        Object value = document.getMetadata().get(key);
+        if (value instanceof Number number) {
+            return number.intValue();
+        }
+        if (value instanceof String stringValue) {
+            try {
+                return Integer.valueOf(stringValue);
+            } catch (NumberFormatException ignored) {
+                return null;
+            }
+        }
+        return null;
     }
 
     private static String removePrefixOverlap(String previous, String current, int maxOverlap) {

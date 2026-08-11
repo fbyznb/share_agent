@@ -17,7 +17,7 @@ spring:
 
   ai:
     dashscope:
-      api-key: ${DASHSCOPE_API_KEY:}
+      api-key:
 
       chat:
         options:
@@ -96,6 +96,18 @@ rocketmq:
     message-model: ${ROCKETMQ_MESSAGE_MODEL:CLUSTERING}
     consume-from-where: ${ROCKETMQ_CONSUME_FROM:CONSUME_FROM_LAST_OFFSET}
     consume-timeout: ${ROCKETMQ_CONSUME_TIMEOUT:15}
+
+canal:
+  bridge:
+    host: ${CANAL_HOST:127.0.0.1}
+    port: ${CANAL_PORT:11111}
+    destination: ${CANAL_DESTINATION:example}
+    username: ${CANAL_USERNAME:}
+    password: ${CANAL_PASSWORD:}
+    subscription: ${CANAL_SUBSCRIPTION:share_agent\.outbox}
+    batch-size: ${CANAL_BATCH_SIZE:100}
+    poll-timeout-millis: ${CANAL_POLL_TIMEOUT_MILLIS:1000}
+    reconnect-delay-millis: ${CANAL_RECONNECT_DELAY_MILLIS:2000}
 
 logging:
   level:

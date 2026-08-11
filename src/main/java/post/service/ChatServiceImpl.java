@@ -14,6 +14,7 @@ import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
 import org.springframework.ai.chat.model.ChatModel;
 import org.springframework.ai.chat.model.ChatResponse;
+import org.springframework.ai.chat.model.ToolContext;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.model.tool.ToolCallingChatOptions;
@@ -56,6 +57,8 @@ public class ChatServiceImpl implements ChatService {
     private static final int MAX_REACT_ITERATIONS = 3;
     private static final int MAX_REACT_TOOL_CALLS = 2;
     private static final int MAX_CONSECUTIVE_NO_NEW_EVIDENCE = 2;
+    private static final int MAX_TOOL_EXECUTION_ATTEMPTS = 3;
+    private static final String ARTICLE_SEARCH_TOOL_NAME = "search_article_chunks";
 
     private static final String STANDALONE_QUESTION_SYSTEM_PROMPT = """
             你是问题改写助手。请结合文章标题和对话历史，将用户的当前问题改写为一个
@@ -324,10 +327,13 @@ public class ChatServiceImpl implements ChatService {
                 "max_iterations": 3,
                 "tool_call_count": 0,
                 "max_tool_calls": 2,
-                "used_queries": [],
                 "visited_chunk_ids": [],
                 "consecutive_no_new_evidence": 0,
                 "stop_reason": null
+              },
+              "tool_control": {
+                "used_tool_calls": [],
+                "disabled_tools": []
               },
               "evidences": []
             }
@@ -832,21 +838,32 @@ public class ChatServiceImpl implements ChatService {
             你是知识社区 ReAct 智能体的决策控制器。
             输入是后端维护的完整 AgentState。你只负责判断证据是否充分，不直接回答用户。
 
+            字段职责：
+            1. react_control：循环预算与终止控制（iteration、tool_call_count、visited_evidence_ids、consecutive_no_new_evidence、stop_reason）。
+            2. tool_control.used_tool_calls：已执行过的“工具名+规范化参数”调用键，不得重复发起。
+            3. tool_control.disabled_tools：因执行失败被后端暂时禁用的工具名，不得再调用。
+            4. observations：工具执行观察历史；status=FAILED 表示该次调用在后端重试后仍失败，safe_message 说明原因。
+            5. evidences：已去重的可用事实证据，优先用于支撑 FINAL_ANSWER。
+
             决策规则：
-            1. 只有缺少的信息能由已注册工具获得，并且结果会明显改善答案时，才调用工具。
-            2. 每轮最多调用一个工具；查询必须具体，不得重复 used_tool_calls 或已有 evidences。
-            3. search_article_chunks 用于检索当前文章原文；get_author_articles 仅用于查询当前文章作者的作品列表。
-            4. 不得把长期记忆当作已验证的外部事实。
-            5. 工具参数中的查询只描述缺失证据，不得包含最终答案。
-            6. 需要工具时必须发起模型原生工具调用，不得输出 TOOL_CALL JSON。
-            7. 不需要工具时只输出以下三种合法 JSON 之一，不得输出 Markdown、解释或答案正文：
+            1. 只有缺少的信息能由当前仍可用的工具获得，并且结果会明显改善答案时，才调用工具。
+            2. 每轮最多调用一个工具；查询必须具体，不得重复 tool_control.used_tool_calls 或已有 evidences。
+            3. 不得调用 tool_control.disabled_tools 中的工具；即使 observations 中有失败记录，也必须以 tool_control 为准。
+            4. 某个工具失败后，优先改用其他未禁用工具，或基于已有 evidences 给出 FINAL_ANSWER；不要假设失败工具会自动恢复。
+            5. search_article_chunks 用于检索当前文章原文。
+            6. get_author_articles 用于查询当前文章作者的文章/作品列表、其他作品或发布数量。当前作者已由后端根据 postId 写入工具上下文，该工具无需参数。
+            7. 用户询问当前文章作者发了多少篇文章、有哪些文章或其他作品，且 evidences 中还没有 get_author_articles 的结果、且该工具未被禁用时，必须调用它，不得询问用户作者是谁。
+            8. 不得把长期记忆当作已验证的外部事实。
+            9. 工具参数中的查询只描述缺失证据，不得包含最终答案。
+            10. 需要工具时必须发起模型原生工具调用，不得输出 TOOL_CALL JSON。
+            11. 不需要工具时只输出以下三种合法 JSON 之一，不得输出 Markdown、解释或答案正文：
 
             {"next_action":"FINAL_ANSWER","user_question":null}
             {"next_action":"ASK_USER","user_question":"一个简短、具体且必须由用户回答的问题"}
             {"next_action":"STOP","user_question":null}
 
             只有缺少的信息必须由用户本人提供且工具、上下文和合理假设都无法获得时，才使用 ASK_USER。
-            已有信息足以回答或继续调用工具价值很低时使用 FINAL_ANSWER。
+            已有信息足以回答、关键工具已禁用，或继续调用工具价值很低时使用 FINAL_ANSWER。
             达到输入状态中的限制时使用 STOP。
             """;
 
@@ -854,6 +871,7 @@ public class ChatServiceImpl implements ChatService {
             你是知识社区问答助手。请根据给定的完整 AgentState 回答用户问题。
             优先回答 independent_question，并结合 conversation_memory 理解上下文。
             long_term_memory 仅用于个性化背景；evidences 是工具返回的事实依据，可能来自文章原文或作者作品列表。
+            observations 中的失败记录表示相关工具调用在后端重试后仍失败，不得假设这些工具结果存在。
             不得编造证据中不存在的文章内容或作者信息。证据不足时应明确说明限制，并给出可执行的最佳努力答案。
             直接输出面向用户的最终答案，不要输出 AgentState、内部状态、思维链或 JSON。
             """;
@@ -890,6 +908,9 @@ public class ChatServiceImpl implements ChatService {
 
     @Autowired
     private AuthorArticlesTool authorArticlesTool;
+
+    @Autowired
+    private MarkdownChunker markdownChunker;
 
     @Override
     @Transactional(rollbackFor = Exception.class)
@@ -932,6 +953,7 @@ public class ChatServiceImpl implements ChatService {
         if (post == null) {
             return Flux.error(new IllegalArgumentException("文章不存在: " + postId));
         }
+        Long articleAuthorId = post.getUserId();
 
         String conversation = conversationMemory.isEmpty()
                 ? "（无历史对话）"
@@ -1036,7 +1058,9 @@ public class ChatServiceImpl implements ChatService {
                 .toList();
 
         List<Evidence> evidences = new ArrayList<>();
+        List<Observation> observations = new ArrayList<>();
         Set<String> usedToolCalls = new HashSet<>();
+        Set<String> disabledTools = new HashSet<>();
         Set<String> visitedEvidenceIds = new HashSet<>();
         String status = "RUNNING";
         String stopReason = null;
@@ -1044,21 +1068,34 @@ public class ChatServiceImpl implements ChatService {
         int iteration = 0;
         int toolCallCount = 0;
         int consecutiveNoNewEvidence = 0;
+        int observationSeq = 0;
+        boolean articleSearchNeeded = memoryRetrievalPlan.articleSearchNeeded();
 
-        ToolCallback[] toolCallbacks = memoryRetrievalPlan.articleSearchNeeded()
-                ? ToolCallbacks.from(articleSearchTool, authorArticlesTool)
-                : ToolCallbacks.from(authorArticlesTool);
         Integer effectiveVersion = version == null ? post.getVersion() : version;
-        ToolCallingChatOptions toolOptions = ToolCallingChatOptions.builder()
-                .toolCallbacks(toolCallbacks)
-                .toolContext(Map.of(
-                        ArticleSearchTool.POST_ID_CONTEXT_KEY, postId,
-                        ArticleSearchTool.VERSION_CONTEXT_KEY, effectiveVersion,
-                        ArticleSearchTool.SEARCH_CONTEXT_KEY, articleSearchContext,
-                        AuthorArticlesTool.AUTHOR_ID_CONTEXT_KEY, post.getUserId()
-                ))
-                .internalToolExecutionEnabled(false)
-                .build();
+        Map<String, Object> toolContext = Map.of(
+                ArticleSearchTool.POST_ID_CONTEXT_KEY, postId,
+                ArticleSearchTool.VERSION_CONTEXT_KEY, effectiveVersion,
+                ArticleSearchTool.SEARCH_CONTEXT_KEY, articleSearchContext,
+                AuthorArticlesTool.AUTHOR_ID_CONTEXT_KEY, articleAuthorId
+        );
+        ToolCallingChatOptions toolOptions = buildToolOptions(
+                articleSearchNeeded,
+                disabledTools,
+                toolContext
+        );
+
+        if (requiresAuthorArticlesEvidence(question)
+                || requiresAuthorArticlesEvidence(independentQuestion)) {
+            List<String> authorArticles = authorArticlesTool.getAuthorArticles(new ToolContext(toolContext));
+            addEvidence(
+                    AuthorArticlesTool.TOOL_NAME,
+                    toJson(authorArticles == null ? List.of() : authorArticles),
+                    visitedEvidenceIds,
+                    evidences
+            );
+            usedToolCalls.add(canonicalToolCallKey(AuthorArticlesTool.TOOL_NAME, "{}"));
+            toolCallCount++;
+        }
 
         AgentState currentState = buildAgentState(
                 question,
@@ -1070,9 +1107,11 @@ public class ChatServiceImpl implements ChatService {
                 iteration,
                 toolCallCount,
                 usedToolCalls,
+                disabledTools,
                 visitedEvidenceIds,
                 consecutiveNoNewEvidence,
                 stopReason,
+                observations,
                 evidences
         );
         Prompt reactPrompt = new Prompt(
@@ -1116,7 +1155,8 @@ public class ChatServiceImpl implements ChatService {
                     ToolCallValidation validation = validateToolCall(
                             toolCalls,
                             toolCallCount,
-                            usedToolCalls
+                            usedToolCalls,
+                            disabledTools
                     );
                     if (!validation.accepted()) {
                         status = "FAILED";
@@ -1127,19 +1167,67 @@ public class ChatServiceImpl implements ChatService {
                     org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall =
                             validation.toolCall();
                     usedToolCalls.add(validation.toolCallKey());
+                    toolCallCount++;
 
-                    ToolExecutionResult executionResult;
-                    try {
-                        executionResult = toolCallingManager.executeToolCalls(reactPrompt, response);
-                        toolCallCount++;
-                    } catch (RuntimeException exception) {
-                        log.error("ReAct 工具调用失败，toolName={}，postId={}，version={}",
-                                toolCall.name(), postId, effectiveVersion, exception);
-                        status = "FAILED";
-                        stopReason = "ERROR";
-                        break;
+                    ToolExecutionOutcome executionOutcome = executeToolCallsWithRetry(reactPrompt, response);
+                    if (!executionOutcome.succeeded()) {
+                        boolean disableTool = shouldDisableToolAfterFailure(executionOutcome.exception());
+                        if (disableTool
+                                && toolCall.name() != null
+                                && !toolCall.name().isBlank()) {
+                            disabledTools.add(toolCall.name());
+                        }
+                        observations.add(buildFailedObservation(
+                                "obs-" + (++observationSeq),
+                                iteration,
+                                toolCall.name(),
+                                validation.toolCallKey(),
+                                executionOutcome.attempts(),
+                                executionOutcome.exception(),
+                                disableTool
+                        ));
+                        consecutiveNoNewEvidence++;
+                        log.error("ReAct 工具调用失败，toolName={}，attempts={}，disabled={}，postId={}，version={}",
+                                toolCall.name(),
+                                executionOutcome.attempts(),
+                                disableTool,
+                                postId,
+                                effectiveVersion,
+                                executionOutcome.exception());
+
+                        currentState = buildAgentState(
+                                question,
+                                independentQuestion,
+                                conversationItems,
+                                exactMemoryItems,
+                                semanticMemoryItems,
+                                status,
+                                iteration,
+                                toolCallCount,
+                                usedToolCalls,
+                                disabledTools,
+                                visitedEvidenceIds,
+                                consecutiveNoNewEvidence,
+                                stopReason,
+                                observations,
+                                evidences
+                        );
+                        toolOptions = buildToolOptions(
+                                articleSearchNeeded,
+                                disabledTools,
+                                toolContext
+                        );
+                        reactPrompt = new Prompt(
+                                List.of(
+                                        new SystemMessage(NATIVE_REACT_CONTROLLER_SYSTEM_PROMPT),
+                                        new UserMessage(toJson(currentState))
+                                ),
+                                toolOptions
+                        );
+                        continue;
                     }
 
+                    ToolExecutionResult executionResult = executionOutcome.result();
                     int newEvidenceCount = appendToolEvidences(
                             executionResult,
                             visitedEvidenceIds,
@@ -1148,6 +1236,14 @@ public class ChatServiceImpl implements ChatService {
                     consecutiveNoNewEvidence = newEvidenceCount == 0
                             ? consecutiveNoNewEvidence + 1
                             : 0;
+                    observations.add(buildSuccessObservation(
+                            "obs-" + (++observationSeq),
+                            iteration,
+                            toolCall.name(),
+                            validation.toolCallKey(),
+                            executionOutcome.attempts(),
+                            newEvidenceCount
+                    ));
 
                     currentState = buildAgentState(
                             question,
@@ -1159,9 +1255,11 @@ public class ChatServiceImpl implements ChatService {
                             iteration,
                             toolCallCount,
                             usedToolCalls,
+                            disabledTools,
                             visitedEvidenceIds,
                             consecutiveNoNewEvidence,
                             stopReason,
+                            observations,
                             evidences
                     );
                     List<org.springframework.ai.chat.messages.Message> nextMessages =
@@ -1203,7 +1301,7 @@ public class ChatServiceImpl implements ChatService {
                         stopReason = "ERROR";
                     }
                 }
-            }
+        }
 
         AgentState finalState = buildAgentState(
                 question,
@@ -1215,9 +1313,11 @@ public class ChatServiceImpl implements ChatService {
                 iteration,
                 toolCallCount,
                 usedToolCalls,
+                disabledTools,
                 visitedEvidenceIds,
                 consecutiveNoNewEvidence,
                 stopReason,
+                observations,
                 evidences
         );
         if ("NEED_USER_INPUT".equals(stopReason)
@@ -1331,22 +1431,32 @@ public class ChatServiceImpl implements ChatService {
                 .toList());
     }
 
+    @Override
     public void saveVectorStore(String content,Integer version,long postId) {
         if (content == null || content.isBlank()) {
             throw new IllegalArgumentException("待向量化的内容不能为空");
         }
 
-        List<String> chunks = chunkMarkdown(content);
+        // Content has already been persisted as the article source. Keep using this
+        // exact Markdown string here so AST analysis never normalizes the original.
+        String originalMarkdown = content;
+        List<MarkdownChunker.MarkdownChunk> chunks = markdownChunker.chunk(originalMarkdown);
 
         // 组装 Document（文本 + 业务元数据），用于向量写入与检索过滤
         List<Document> docs = new ArrayList<>(chunks.size());
         for (int i = 0; i < chunks.size(); i++) {
+            MarkdownChunker.MarkdownChunk chunk = chunks.get(i);
             String cid = postId + "#" + i;
             Map<String, Object> meta = new HashMap<>();
             meta.put("postId", String.valueOf(postId));
             meta.put("version", String.valueOf(version));
             meta.put("chunkId", cid);
-            docs.add(new Document(chunks.get(i), meta));
+            meta.put("tokenCount", chunk.tokenCount());
+            meta.put("headingPaths", String.join(" | ", chunk.headingPaths()));
+            meta.put("blockTypes", String.join(",", chunk.blockTypes()));
+            meta.put("sourceStart", chunk.startOffset());
+            meta.put("sourceEnd", chunk.endOffset());
+            docs.add(new Document(chunk.text(), meta));
         }
         try {
             vectorStore.add(docs);
@@ -1354,44 +1464,6 @@ public class ChatServiceImpl implements ChatService {
 
             throw new RuntimeException("VectorStore add failed", e);
         }
-    }
-
-    private List<String> chunkMarkdown(String text) {
-        List<String> paras = new ArrayList<>();
-        String[] lines = text.split("\r?\n");
-        StringBuilder buf = new StringBuilder();
-        for (String line : lines) {
-            boolean isHeader = line.startsWith("#");
-            if (isHeader && !buf.isEmpty()) { // 遇到新的标题，收束上一段
-                paras.add(buf.toString());
-                buf.setLength(0);
-            }
-            buf.append(line).append('\n');
-        }
-        if (!buf.isEmpty()) paras.add(buf.toString());
-
-        return getChunks(paras);
-    }
-    /**
-     * 固定长度切片（每片 ≤ 800 字符），切片间 100 字符重叠：
-     * - 兼顾检索召回与上下文连续性
-     */
-    private static List<String> getChunks(List<String> paras) {
-        List<String> chunks = new ArrayList<>();
-        for (String p : paras) {
-            if (p.length() <= 800) {
-                chunks.add(p);
-            } else {
-                int start = 0;
-                while (start < p.length()) {
-                    int end = Math.min(start + 800, p.length());
-                    chunks.add(p.substring(start, end));
-                    if (end >= p.length()) break;
-                    start = Math.max(end - 100, start + 1); // 重叠 100 字符以保留语义连续
-                }
-            }
-        }
-        return chunks;
     }
 
     private String toJson(Object value) {
@@ -1412,9 +1484,11 @@ public class ChatServiceImpl implements ChatService {
             int iteration,
             int toolCallCount,
             Set<String> usedToolCalls,
+            Set<String> disabledTools,
             Set<String> visitedEvidenceIds,
             int consecutiveNoNewEvidence,
             String stopReason,
+            List<Observation> observations,
             List<Evidence> evidences
     ) {
         return new AgentState(
@@ -1428,19 +1502,165 @@ public class ChatServiceImpl implements ChatService {
                         MAX_REACT_ITERATIONS,
                         toolCallCount,
                         MAX_REACT_TOOL_CALLS,
-                        List.copyOf(usedToolCalls),
                         List.copyOf(visitedEvidenceIds),
                         consecutiveNoNewEvidence,
                         stopReason
                 ),
+                new ToolControl(
+                        List.copyOf(usedToolCalls),
+                        List.copyOf(disabledTools)
+                ),
+                List.copyOf(observations),
                 List.copyOf(evidences)
         );
+    }
+
+    private ToolCallingChatOptions buildToolOptions(
+            boolean articleSearchNeeded,
+            Set<String> disabledTools,
+            Map<String, Object> toolContext
+    ) {
+        List<Object> tools = new ArrayList<>(2);
+        if (articleSearchNeeded && !disabledTools.contains(ARTICLE_SEARCH_TOOL_NAME)) {
+            tools.add(articleSearchTool);
+        }
+        if (!disabledTools.contains(AuthorArticlesTool.TOOL_NAME)) {
+            tools.add(authorArticlesTool);
+        }
+        ToolCallback[] toolCallbacks = tools.isEmpty()
+                ? new ToolCallback[0]
+                : ToolCallbacks.from(tools.toArray());
+        return ToolCallingChatOptions.builder()
+                .toolCallbacks(toolCallbacks)
+                .toolContext(toolContext)
+                .internalToolExecutionEnabled(false)
+                .build();
+    }
+
+    private ToolExecutionOutcome executeToolCallsWithRetry(Prompt reactPrompt, ChatResponse response) {
+        RuntimeException lastException = null;
+        int attempts = 0;
+        for (int attempt = 1; attempt <= MAX_TOOL_EXECUTION_ATTEMPTS; attempt++) {
+            attempts = attempt;
+            try {
+                ToolExecutionResult result = toolCallingManager.executeToolCalls(reactPrompt, response);
+                return new ToolExecutionOutcome(result, attempts, null);
+            } catch (RuntimeException exception) {
+                lastException = exception;
+                if (!isRetryableToolFailure(exception) || attempt >= MAX_TOOL_EXECUTION_ATTEMPTS) {
+                    break;
+                }
+                log.warn("ReAct 工具执行失败，准备重试，attempt={}/{}",
+                        attempt, MAX_TOOL_EXECUTION_ATTEMPTS, exception);
+            }
+        }
+        return new ToolExecutionOutcome(null, attempts, lastException);
+    }
+
+    private static boolean isRetryableToolFailure(RuntimeException exception) {
+        // 当前工具均为只读检索，除参数非法外默认允许执行层重试。
+        return !(exception instanceof IllegalArgumentException);
+    }
+
+    private static boolean shouldDisableToolAfterFailure(RuntimeException exception) {
+        return exception != null && !(exception instanceof IllegalArgumentException);
+    }
+
+    private static Observation buildFailedObservation(
+            String observationId,
+            int iteration,
+            String toolName,
+            String callKey,
+            int attempts,
+            RuntimeException exception,
+            boolean toolDisabled
+    ) {
+        boolean retryable = isRetryableToolFailure(exception);
+        return new Observation(
+                observationId,
+                iteration,
+                toolName,
+                callKey,
+                "FAILED",
+                attempts,
+                new ObservationError(
+                        resolveToolErrorCode(exception),
+                        retryable ? "TRANSIENT" : "PERMANENT",
+                        toolDisabled ? "TOOL" : "CALL",
+                        resolveToolSafeMessage(exception, toolDisabled),
+                        retryable,
+                        true
+                ),
+                null
+        );
+    }
+
+    private static Observation buildSuccessObservation(
+            String observationId,
+            int iteration,
+            String toolName,
+            String callKey,
+            int attempts,
+            int newEvidenceCount
+    ) {
+        return new Observation(
+                observationId,
+                iteration,
+                toolName,
+                callKey,
+                "SUCCESS",
+                attempts,
+                null,
+                new ObservationResult(newEvidenceCount)
+        );
+    }
+
+    private static String resolveToolErrorCode(RuntimeException exception) {
+        if (exception == null) {
+            return "TOOL_EXECUTION_ERROR";
+        }
+        if (exception instanceof IllegalArgumentException) {
+            return "INVALID_ARGUMENT";
+        }
+        String message = exception.getMessage() == null
+                ? ""
+                : exception.getMessage().toLowerCase(java.util.Locale.ROOT);
+        String typeName = exception.getClass().getSimpleName().toLowerCase(java.util.Locale.ROOT);
+        if (message.contains("timeout") || message.contains("timed out") || typeName.contains("timeout")) {
+            return "UPSTREAM_TIMEOUT";
+        }
+        if (message.contains("429") || message.contains("rate limit")) {
+            return "RATE_LIMITED";
+        }
+        if (message.contains("503")
+                || message.contains("unavailable")
+                || message.contains("502")
+                || message.contains("504")) {
+            return "UPSTREAM_UNAVAILABLE";
+        }
+        return "TOOL_EXECUTION_ERROR";
+    }
+
+    private static String resolveToolSafeMessage(RuntimeException exception, boolean toolDisabled) {
+        String code = resolveToolErrorCode(exception);
+        return switch (code) {
+            case "INVALID_ARGUMENT" -> "工具参数无效，本次调用已拒绝，可更换参数后重试其他查询。";
+            case "UPSTREAM_TIMEOUT" -> toolDisabled
+                    ? "工具上游超时，后端重试后仍失败，该工具已暂时禁用。"
+                    : "工具上游超时，后端重试后仍失败。";
+            case "RATE_LIMITED" -> "工具触发限流，后端重试后仍失败，该工具已暂时禁用。";
+            case "UPSTREAM_UNAVAILABLE" -> "工具上游暂不可用，后端重试后仍失败，该工具已暂时禁用。";
+            default -> toolDisabled
+                    ? "工具执行失败，后端重试后仍失败，该工具已暂时禁用。"
+                    : "工具执行失败，后端重试后仍失败。";
+        };
     }
 
     private ToolCallValidation validateToolCall(
             List<org.springframework.ai.chat.messages.AssistantMessage.ToolCall> toolCalls,
             int toolCallCount,
-            Set<String> usedToolCalls
+            Set<String> usedToolCalls,
+            Set<String> disabledTools
     ) {
         if (toolCalls == null
                 || toolCalls.size() != 1
@@ -1448,6 +1668,9 @@ public class ChatServiceImpl implements ChatService {
             return new ToolCallValidation(null, null, "LIMIT_REACHED");
         }
         org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall = toolCalls.get(0);
+        if (disabledTools.contains(toolCall.name())) {
+            return new ToolCallValidation(null, null, "ERROR");
+        }
         String toolCallKey = canonicalToolCallKey(toolCall.name(), toolCall.arguments());
         if (usedToolCalls.contains(toolCallKey)) {
             return new ToolCallValidation(null, null, "ERROR");
@@ -1465,6 +1688,38 @@ public class ChatServiceImpl implements ChatService {
             }
         }
         return toolName + ":" + canonicalArguments;
+    }
+
+    private static boolean requiresAuthorArticlesEvidence(String question) {
+        if (question == null || question.isBlank()) {
+            return false;
+        }
+        String normalized = question.toLowerCase(java.util.Locale.ROOT)
+                .replaceAll("\\s+", "");
+        boolean mentionsAuthor = normalized.contains("作者")
+                || normalized.contains("author");
+        boolean mentionsArticles = normalized.contains("文章")
+                || normalized.contains("作品")
+                || normalized.contains("帖子")
+                || normalized.contains("博文")
+                || normalized.contains("article")
+                || normalized.contains("post")
+                || normalized.contains("work");
+        boolean asksForCollection = normalized.contains("多少")
+                || normalized.contains("几篇")
+                || normalized.contains("数量")
+                || normalized.contains("总数")
+                || normalized.contains("一共")
+                || normalized.contains("全部")
+                || normalized.contains("所有")
+                || normalized.contains("其他")
+                || normalized.contains("哪些")
+                || normalized.contains("列表")
+                || normalized.contains("howmany")
+                || normalized.contains("count")
+                || normalized.contains("list")
+                || normalized.contains("other");
+        return mentionsAuthor && mentionsArticles && asksForCollection;
     }
 
     private int appendToolEvidences(
@@ -1578,6 +1833,8 @@ public class ChatServiceImpl implements ChatService {
             @JsonProperty("conversation_memory") List<ConversationMemoryItem> conversationMemory,
             @JsonProperty("long_term_memory") LongTermMemoryState longTermMemory,
             @JsonProperty("react_control") ReactControl reactControl,
+            @JsonProperty("tool_control") ToolControl toolControl,
+            List<Observation> observations,
             List<Evidence> evidences
     ) {
     }
@@ -1604,11 +1861,53 @@ public class ChatServiceImpl implements ChatService {
             @JsonProperty("max_iterations") int maxIterations,
             @JsonProperty("tool_call_count") int toolCallCount,
             @JsonProperty("max_tool_calls") int maxToolCalls,
-            @JsonProperty("used_tool_calls") List<String> usedToolCalls,
             @JsonProperty("visited_evidence_ids") List<String> visitedEvidenceIds,
             @JsonProperty("consecutive_no_new_evidence") int consecutiveNoNewEvidence,
             @JsonProperty("stop_reason") String stopReason
     ) {
+    }
+
+    private record ToolControl(
+            @JsonProperty("used_tool_calls") List<String> usedToolCalls,
+            @JsonProperty("disabled_tools") List<String> disabledTools
+    ) {
+    }
+
+    private record Observation(
+            @JsonProperty("observation_id") String observationId,
+            int iteration,
+            @JsonProperty("tool_name") String toolName,
+            @JsonProperty("call_key") String callKey,
+            String status,
+            int attempts,
+            ObservationError error,
+            ObservationResult result
+    ) {
+    }
+
+    private record ObservationError(
+            String code,
+            String category,
+            String scope,
+            @JsonProperty("safe_message") String safeMessage,
+            boolean retryable,
+            @JsonProperty("retry_exhausted") boolean retryExhausted
+    ) {
+    }
+
+    private record ObservationResult(
+            @JsonProperty("new_evidence_count") int newEvidenceCount
+    ) {
+    }
+
+    private record ToolExecutionOutcome(
+            ToolExecutionResult result,
+            int attempts,
+            RuntimeException exception
+    ) {
+        private boolean succeeded() {
+            return result != null && exception == null;
+        }
     }
 
     private record TerminalDecision(
