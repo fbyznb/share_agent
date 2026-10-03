@@ -21,4 +21,12 @@ public class SkuController {
     ) {
         return skuService.fav(skuId,userId,isFav);
     }
+
+    @PostMapping("/buy")
+    public Long buy(
+            @RequestParam Long skuId,
+            @RequestParam Long userId
+    ) {
+        return skuService.buy(skuId, userId);
+    }
 }

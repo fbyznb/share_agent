@@ -1,5 +1,7 @@
 package post.mq;
 
+import co.elastic.clients.elasticsearch.ElasticsearchClient;
+import co.elastic.clients.elasticsearch.core.SearchResponse;
 import post.mapper.PostMapper;
 import post.model.Content;
 import post.model.Post;
@@ -12,10 +14,12 @@ import org.redisson.api.RBloomFilter;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
+import java.io.IOException;
 import java.util.List;
 
 
@@ -59,6 +63,10 @@ public class VersionPublishConsumer implements RocketMQListener<Pav> {
     private ChatService chatService;
     @Autowired
     private StringRedisTemplate stringRedisTemplate;
+    @Autowired
+    private ElasticsearchClient elasticsearchClient;
+    @Value("${spring.ai.vectorstore.elasticsearch.index-name}")
+    private String indexName;
 
     @Override
     public void onMessage(Pav pav) {
@@ -74,7 +82,8 @@ public class VersionPublishConsumer implements RocketMQListener<Pav> {
                 return;
             }
             Content content = contentMapper.selectContentByPost(pav.postId, pav.version + 1);
-            if (content != null) {
+            // 已有当前待发布版本的切片时，跳过向量写入并继续发布。
+            if (content != null && !hasVersionChunks(pav.postId, pav.version + 1)) {
                 chatService.saveVectorStore(content.getContent(),pav.version+1,pav.postId);
             }
             if(post.getStatus() == 1){
@@ -94,6 +103,33 @@ public class VersionPublishConsumer implements RocketMQListener<Pav> {
             if (isLock && lock.isHeldByCurrentThread()) {
                 lock.unlock();
             }
+        }
+    }
+
+    private boolean hasVersionChunks(Long postId, Integer version) {
+        try {
+            SearchResponse<Void> response = elasticsearchClient.search(
+                    search -> search
+                            .index(indexName)
+                            .size(1)
+                            .source(source -> source.fetch(false))
+                            .trackTotalHits(total -> total.enabled(false))
+                            .allowPartialSearchResults(false)
+                            .query(query -> query.bool(bool -> bool
+                                    .filter(filter -> filter.term(term -> term
+                                            .field("metadata.postId")
+                                            .value(String.valueOf(postId))))
+                                    .filter(filter -> filter.term(term -> term
+                                            .field("metadata.version")
+                                            .value(String.valueOf(version)))))),
+                    Void.class
+            );
+            if (response.timedOut()) {
+                throw new IllegalStateException("查询文章版本切片超时");
+            }
+            return !response.hits().hits().isEmpty();
+        } catch (IOException exception) {
+            throw new IllegalStateException("查询文章版本切片失败", exception);
         }
     }
 

@@ -1,11 +1,14 @@
 package post.controller;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.MediaType;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+
 
 import reactor.core.publisher.Flux;
 
@@ -55,7 +58,7 @@ public class PostController {
         return postService.selectPost(postId);
     }
 
-    @GetMapping(path = "/chat")
+    @GetMapping(path = "/chat",produces = MediaType.TEXT_EVENT_STREAM_VALUE)
     public Flux<String> chat(
             @RequestParam("userId") Long userId,
             @RequestParam("conversationId") Long conversationId,

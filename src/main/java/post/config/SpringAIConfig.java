@@ -32,6 +32,7 @@ public class SpringAIConfig {
         return SummarizingWindowChatMemory.builder()
                 .chatMemoryRepository(chatMemoryRepository)
                 .chatClient(chatClient)
+                .maxMessages(6)
                 .build();
     }
 }

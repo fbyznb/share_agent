@@ -2,13 +2,14 @@ package post.service;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.SignalType;
 
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
 import org.springframework.ai.chat.messages.SystemMessage;
 import org.springframework.ai.chat.messages.ToolResponseMessage;
 import org.springframework.ai.chat.messages.UserMessage;
@@ -40,12 +41,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 import lombok.extern.slf4j.Slf4j;
 
 import post.mapper.PostMapper;
 import post.memory.SummarizingWindowChatMemory;
 import post.model.Message;
 import post.model.Post;
+import post.mq.MemoryUpdateMessage;
 import post.tool.ArticleSearchTool;
 import post.tool.AuthorArticlesTool;
 
@@ -57,7 +60,10 @@ public class ChatServiceImpl implements ChatService {
     private static final int MAX_REACT_ITERATIONS = 3;
     private static final int MAX_REACT_TOOL_CALLS = 2;
     private static final int MAX_CONSECUTIVE_NO_NEW_EVIDENCE = 2;
-    private static final int MAX_TOOL_EXECUTION_ATTEMPTS = 3;
+    // 调用失败、空响应和非法决策共用连续失败预算，首次失败后最多再决策一次。
+    private static final int MAX_CONSECUTIVE_VALIDATION_FAILURES = 2;
+    // 首次执行 + 最多一次执行层重试，不属于模型可调整的状态字段。
+    private static final int MAX_TOOL_EXECUTION_ATTEMPTS = 2;
     private static final String ARTICLE_SEARCH_TOOL_NAME = "search_article_chunks";
 
     private static final String STANDALONE_QUESTION_SYSTEM_PROMPT = """
@@ -839,11 +845,12 @@ public class ChatServiceImpl implements ChatService {
             输入是后端维护的完整 AgentState。你只负责判断证据是否充分，不直接回答用户。
 
             字段职责：
-            1. react_control：循环预算与终止控制（iteration、tool_call_count、visited_evidence_ids、consecutive_no_new_evidence、stop_reason）。
+            1. react_control：循环预算与终止控制，包括决策轮数、工具调用次数、连续无新证据次数、连续校验失败次数及其上限。
             2. tool_control.used_tool_calls：已执行过的“工具名+规范化参数”调用键，不得重复发起。
             3. tool_control.disabled_tools：因执行失败被后端暂时禁用的工具名，不得再调用。
             4. observations：工具执行观察历史；status=FAILED 表示该次调用在后端重试后仍失败，safe_message 说明原因。
             5. evidences：已去重的可用事实证据，优先用于支撑 FINAL_ANSWER。
+            6. decision_rejections：决策调用失败、空响应或校验拒绝的历史；这些轮次没有执行工具，feedback 说明下一轮应如何处理。
 
             决策规则：
             1. 只有缺少的信息能由当前仍可用的工具获得，并且结果会明显改善答案时，才调用工具。
@@ -865,6 +872,10 @@ public class ChatServiceImpl implements ChatService {
             只有缺少的信息必须由用户本人提供且工具、上下文和合理假设都无法获得时，才使用 ASK_USER。
             已有信息足以回答、关键工具已禁用，或继续调用工具价值很低时使用 FINAL_ANSWER。
             达到输入状态中的限制时使用 STOP。
+            如果上一轮决策被拒绝，请依据最新 decision_rejections.feedback 修正，不要原样重复。
+            决策调用失败、空响应或校验失败均计入 consecutive_validation_failures，仅允许连续重试或纠正一次。
+            每次决策调用尝试均消耗正常决策轮数；合法决策会清零连续失败次数。
+            不得将拒绝记录当作工具已执行或已获得事实证据。
             """;
 
     private static final String FINAL_ANSWER_SYSTEM_PROMPT = """
@@ -872,6 +883,7 @@ public class ChatServiceImpl implements ChatService {
             优先回答 independent_question，并结合 conversation_memory 理解上下文。
             long_term_memory 仅用于个性化背景；evidences 是工具返回的事实依据，可能来自文章原文或作者作品列表。
             observations 中的失败记录表示相关工具调用在后端重试后仍失败，不得假设这些工具结果存在。
+            decision_rejections 是决策调用失败、空响应或校验拒绝的记录，不是工具结果或事实证据。
             不得编造证据中不存在的文章内容或作者信息。证据不足时应明确说明限制，并给出可执行的最佳努力答案。
             直接输出面向用户的最终答案，不要输出 AgentState、内部状态、思维链或 JSON。
             """;
@@ -948,6 +960,7 @@ public class ChatServiceImpl implements ChatService {
             Long postId,
             Integer version
     ) {
+        //1、获取会话记忆
         List<Message> conversationMemory = chatMemory.get(String.valueOf(conversationId));
         Post post = postMapper.select(postId);
         if (post == null) {
@@ -972,7 +985,7 @@ public class ChatServiceImpl implements ChatService {
                 %s
                 </current-question>
                 """.formatted(post.getTitle(), conversation, question);
-
+        //2、利用会话记忆和当前问题生成独立问题
         String independentQuestion = chatClient.prompt()
                 .system(STANDALONE_QUESTION_SYSTEM_PROMPT)
                 .user(userPrompt)
@@ -983,6 +996,7 @@ public class ChatServiceImpl implements ChatService {
         } else {
             independentQuestion = independentQuestion.trim();
         }
+
         String memoryPlannerUserPrompt = """
                 <independent-question>
                 %s
@@ -991,7 +1005,7 @@ public class ChatServiceImpl implements ChatService {
                 %s
                 </conversation-history>
                 """.formatted(independentQuestion, conversation);
-
+        //3、利用独立问题和会话历史生成长期记忆检索计划
         MemoryRetrievalPlan memoryRetrievalPlan = chatClient.prompt()
                 .system(MEMORY_RETRIEVAL_PLANNER_SYSTEM_PROMPT)
                 .user(memoryPlannerUserPrompt)
@@ -1000,6 +1014,7 @@ public class ChatServiceImpl implements ChatService {
         if (memoryRetrievalPlan == null) {
             return Flux.error(new IllegalStateException("大模型未返回长期记忆检索计划"));
         }
+        //4、精确长期记忆和语义长期记忆查询
         List<ExactLongMemory> exactLongMemories = queryExactLongMemories(
                 userId,
                 memoryRetrievalPlan.exactMemory()
@@ -1008,10 +1023,6 @@ public class ChatServiceImpl implements ChatService {
                 userId,
                 memoryRetrievalPlan.vectorMemory()
         );
-        List<Message> longMemoryMessages = new ArrayList<>(conversationMemory);
-        longMemoryMessages.add(new Message(conversationId, version, "user", question));
-        rocketMQTemplate.syncSend("get_long_memory", longMemoryMessages);
-
         String exactMemoryContext = exactLongMemories.isEmpty()
                 ? "（无精确长期记忆）"
                 : String.join("\n", exactLongMemories.stream()
@@ -1059,6 +1070,7 @@ public class ChatServiceImpl implements ChatService {
 
         List<Evidence> evidences = new ArrayList<>();
         List<Observation> observations = new ArrayList<>();
+        List<DecisionRejection> decisionRejections = new ArrayList<>();
         Set<String> usedToolCalls = new HashSet<>();
         Set<String> disabledTools = new HashSet<>();
         Set<String> visitedEvidenceIds = new HashSet<>();
@@ -1068,6 +1080,7 @@ public class ChatServiceImpl implements ChatService {
         int iteration = 0;
         int toolCallCount = 0;
         int consecutiveNoNewEvidence = 0;
+        int consecutiveValidationFailures = 0;
         int observationSeq = 0;
         boolean articleSearchNeeded = memoryRetrievalPlan.articleSearchNeeded();
 
@@ -1078,50 +1091,41 @@ public class ChatServiceImpl implements ChatService {
                 ArticleSearchTool.SEARCH_CONTEXT_KEY, articleSearchContext,
                 AuthorArticlesTool.AUTHOR_ID_CONTEXT_KEY, articleAuthorId
         );
-        ToolCallingChatOptions toolOptions = buildToolOptions(
-                articleSearchNeeded,
-                disabledTools,
-                toolContext
-        );
-
         if (requiresAuthorArticlesEvidence(question)
                 || requiresAuthorArticlesEvidence(independentQuestion)) {
-            List<String> authorArticles = authorArticlesTool.getAuthorArticles(new ToolContext(toolContext));
-            addEvidence(
-                    AuthorArticlesTool.TOOL_NAME,
-                    toJson(authorArticles == null ? List.of() : authorArticles),
-                    visitedEvidenceIds,
-                    evidences
-            );
-            usedToolCalls.add(canonicalToolCallKey(AuthorArticlesTool.TOOL_NAME, "{}"));
+            String callKey = canonicalToolCallKey(AuthorArticlesTool.TOOL_NAME, "{}");
+            usedToolCalls.add(callKey);
             toolCallCount++;
+
+            // 预取同样受执行层重试限制，并进入观察历史。
+            ToolExecutionOutcome<List<String>> outcome = executeWithRetry(() -> {
+                List<String> articles = authorArticlesTool.getAuthorArticles(new ToolContext(toolContext));
+                return articles == null ? List.<String>of() : articles;
+            });
+            if (outcome.succeeded()) {
+                int added = addEvidence(
+                        AuthorArticlesTool.TOOL_NAME, toJson(outcome.result()),
+                        visitedEvidenceIds, evidences
+                );
+                consecutiveNoNewEvidence = added == 0 ? consecutiveNoNewEvidence + 1 : 0;
+                observations.add(buildSuccessObservation(
+                        "obs-" + (++observationSeq), iteration,
+                        AuthorArticlesTool.TOOL_NAME, callKey, outcome.attempts(), added
+                ));
+            } else {
+                boolean disableTool = shouldDisableToolAfterFailure(outcome.exception());
+                if (disableTool) {
+                    disabledTools.add(AuthorArticlesTool.TOOL_NAME);
+                }
+                observations.add(buildFailedObservation(
+                        "obs-" + (++observationSeq), iteration,
+                        AuthorArticlesTool.TOOL_NAME, callKey,
+                        outcome.attempts(), outcome.exception(), disableTool
+                ));
+                consecutiveNoNewEvidence++;
+            }
         }
-
-        AgentState currentState = buildAgentState(
-                question,
-                independentQuestion,
-                conversationItems,
-                exactMemoryItems,
-                semanticMemoryItems,
-                status,
-                iteration,
-                toolCallCount,
-                usedToolCalls,
-                disabledTools,
-                visitedEvidenceIds,
-                consecutiveNoNewEvidence,
-                stopReason,
-                observations,
-                evidences
-        );
-        Prompt reactPrompt = new Prompt(
-                List.of(
-                        new SystemMessage(NATIVE_REACT_CONTROLLER_SYSTEM_PROMPT),
-                        new UserMessage(toJson(currentState))
-                ),
-                toolOptions
-        );
-
+        //5、每轮从完整状态重建请求，拒绝的原生工具调用不会遗留在消息历史中。
         while ("RUNNING".equals(status)) {
                 // 硬限制只由后端状态判断，模型不能绕过。
                 if (iteration >= MAX_REACT_ITERATIONS
@@ -1132,44 +1136,64 @@ public class ChatServiceImpl implements ChatService {
                     break;
                 }
 
-                ChatResponse response;
+                AgentState currentState = buildAgentState(
+                        question, independentQuestion, conversationItems,
+                        exactMemoryItems, semanticMemoryItems,
+                        status, iteration, toolCallCount,
+                        usedToolCalls, disabledTools, visitedEvidenceIds,
+                        consecutiveNoNewEvidence, consecutiveValidationFailures,
+                        stopReason, observations, evidences, decisionRejections
+                );
+                ToolCallingChatOptions toolOptions = buildToolOptions(
+                        articleSearchNeeded, disabledTools, toolContext
+                );
+                Prompt reactPrompt = new Prompt(
+                        List.of(
+                                new SystemMessage(NATIVE_REACT_CONTROLLER_SYSTEM_PROMPT),
+                                new UserMessage(toJson(currentState))
+                        ),
+                        toolOptions
+                );
+
+                ChatResponse response = null;
+                DecisionValidation validation = null;
+                // 决策调用失败同样消耗本轮预算，避免失败重试绕过最大轮数。
+                iteration++;
                 try {
                     response = chatModel.call(reactPrompt);
                 } catch (RuntimeException exception) {
                     log.error("ReAct 决策调用失败，postId={}，version={}", postId, effectiveVersion, exception);
-                    status = "FAILED";
-                    stopReason = "ERROR";
-                    break;
+                    validation = DecisionValidation.reject("DECISION_CALL_FAILED",
+                            "上一轮决策调用失败，未获得可用决策，也未执行工具。请根据当前状态重新决策。");
                 }
-                iteration++;
-
-                if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
-                    status = "FAILED";
-                    stopReason = "ERROR";
-                    break;
-                }
-
-                if (response.hasToolCalls()) {
-                    List<org.springframework.ai.chat.messages.AssistantMessage.ToolCall> toolCalls =
-                            response.getResult().getOutput().getToolCalls();
-                    ToolCallValidation validation = validateToolCall(
-                            toolCalls,
-                            toolCallCount,
-                            usedToolCalls,
-                            disabledTools
+                if (validation == null) {
+                    validation = validateDecision(
+                            response, articleSearchNeeded, usedToolCalls, disabledTools
                     );
-                    if (!validation.accepted()) {
+                }
+                if (!validation.accepted()) {
+                    consecutiveValidationFailures++;
+                    decisionRejections.add(new DecisionRejection(
+                            iteration, validation.errorCode(), validation.feedback()
+                    ));
+                    if (consecutiveValidationFailures >= MAX_CONSECUTIVE_VALIDATION_FAILURES) {
                         status = "FAILED";
-                        stopReason = validation.stopReason();
+                        stopReason = "ERROR";
                         break;
                     }
+                    // 工具未执行，不扣工具预算，不修改连续无新证据次数。
+                    // 下一轮入口仍检查硬预算，并将拒绝原因放进新的 Prompt。
+                    continue;
+                }
 
-                    org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall =
-                            validation.toolCall();
+                consecutiveValidationFailures = 0;
+                if (validation.toolCall() != null) {
+                    AssistantMessage.ToolCall toolCall = validation.toolCall();
                     usedToolCalls.add(validation.toolCallKey());
                     toolCallCount++;
 
-                    ToolExecutionOutcome executionOutcome = executeToolCallsWithRetry(reactPrompt, response);
+                    ToolExecutionOutcome<ToolExecutionResult> executionOutcome =
+                            executeToolCallsWithRetry(reactPrompt, response);
                     if (!executionOutcome.succeeded()) {
                         boolean disableTool = shouldDisableToolAfterFailure(executionOutcome.exception());
                         if (disableTool
@@ -1195,35 +1219,6 @@ public class ChatServiceImpl implements ChatService {
                                 effectiveVersion,
                                 executionOutcome.exception());
 
-                        currentState = buildAgentState(
-                                question,
-                                independentQuestion,
-                                conversationItems,
-                                exactMemoryItems,
-                                semanticMemoryItems,
-                                status,
-                                iteration,
-                                toolCallCount,
-                                usedToolCalls,
-                                disabledTools,
-                                visitedEvidenceIds,
-                                consecutiveNoNewEvidence,
-                                stopReason,
-                                observations,
-                                evidences
-                        );
-                        toolOptions = buildToolOptions(
-                                articleSearchNeeded,
-                                disabledTools,
-                                toolContext
-                        );
-                        reactPrompt = new Prompt(
-                                List.of(
-                                        new SystemMessage(NATIVE_REACT_CONTROLLER_SYSTEM_PROMPT),
-                                        new UserMessage(toJson(currentState))
-                                ),
-                                toolOptions
-                        );
                         continue;
                     }
 
@@ -1245,43 +1240,10 @@ public class ChatServiceImpl implements ChatService {
                             newEvidenceCount
                     ));
 
-                    currentState = buildAgentState(
-                            question,
-                            independentQuestion,
-                            conversationItems,
-                            exactMemoryItems,
-                            semanticMemoryItems,
-                            status,
-                            iteration,
-                            toolCallCount,
-                            usedToolCalls,
-                            disabledTools,
-                            visitedEvidenceIds,
-                            consecutiveNoNewEvidence,
-                            stopReason,
-                            observations,
-                            evidences
-                    );
-                    List<org.springframework.ai.chat.messages.Message> nextMessages =
-                            new ArrayList<>(executionResult.conversationHistory());
-                    nextMessages.add(new UserMessage("""
-                            <agent-state-update>
-                            %s
-                            </agent-state-update>
-                            """.formatted(toJson(currentState))));
-                    reactPrompt = new Prompt(nextMessages, toolOptions);
                     continue;
                 }
 
-                TerminalDecision decision = parseTerminalDecision(
-                        response.getResult().getOutput().getText()
-                );
-                if (decision == null || decision.nextAction() == null) {
-                    status = "FAILED";
-                    stopReason = "ERROR";
-                    break;
-                }
-
+                TerminalDecision decision = validation.terminalDecision();
                 switch (decision.nextAction()) {
                     case "FINAL_ANSWER" -> {
                         status = "COMPLETED";
@@ -1316,9 +1278,11 @@ public class ChatServiceImpl implements ChatService {
                 disabledTools,
                 visitedEvidenceIds,
                 consecutiveNoNewEvidence,
+                consecutiveValidationFailures,
                 stopReason,
                 observations,
-                evidences
+                evidences,
+                decisionRejections
         );
         if ("NEED_USER_INPUT".equals(stopReason)
                 && userQuestion != null
@@ -1327,7 +1291,8 @@ public class ChatServiceImpl implements ChatService {
                     Flux.just(userQuestion),
                     conversationId,
                     effectiveVersion,
-                    question
+                    question,
+                    conversationMemory
             );
         }
         return saveConversation(
@@ -1338,7 +1303,8 @@ public class ChatServiceImpl implements ChatService {
                         .content(),
                 conversationId,
                 effectiveVersion,
-                question
+                question,
+                conversationMemory
         );
     }
 
@@ -1487,9 +1453,11 @@ public class ChatServiceImpl implements ChatService {
             Set<String> disabledTools,
             Set<String> visitedEvidenceIds,
             int consecutiveNoNewEvidence,
+            int consecutiveValidationFailures,
             String stopReason,
             List<Observation> observations,
-            List<Evidence> evidences
+            List<Evidence> evidences,
+            List<DecisionRejection> decisionRejections
     ) {
         return new AgentState(
                 originalQuestion,
@@ -1504,6 +1472,9 @@ public class ChatServiceImpl implements ChatService {
                         MAX_REACT_TOOL_CALLS,
                         List.copyOf(visitedEvidenceIds),
                         consecutiveNoNewEvidence,
+                        MAX_CONSECUTIVE_NO_NEW_EVIDENCE,
+                        consecutiveValidationFailures,
+                        MAX_CONSECUTIVE_VALIDATION_FAILURES,
                         stopReason
                 ),
                 new ToolControl(
@@ -1511,7 +1482,8 @@ public class ChatServiceImpl implements ChatService {
                         List.copyOf(disabledTools)
                 ),
                 List.copyOf(observations),
-                List.copyOf(evidences)
+                List.copyOf(evidences),
+                List.copyOf(decisionRejections)
         );
     }
 
@@ -1537,14 +1509,23 @@ public class ChatServiceImpl implements ChatService {
                 .build();
     }
 
-    private ToolExecutionOutcome executeToolCallsWithRetry(Prompt reactPrompt, ChatResponse response) {
+    private ToolExecutionOutcome<ToolExecutionResult> executeToolCallsWithRetry(
+            Prompt reactPrompt, ChatResponse response
+    ) {
+        return executeWithRetry(() -> toolCallingManager.executeToolCalls(reactPrompt, response));
+    }
+
+    private <T> ToolExecutionOutcome<T> executeWithRetry(Supplier<T> operation) {
         RuntimeException lastException = null;
         int attempts = 0;
         for (int attempt = 1; attempt <= MAX_TOOL_EXECUTION_ATTEMPTS; attempt++) {
             attempts = attempt;
             try {
-                ToolExecutionResult result = toolCallingManager.executeToolCalls(reactPrompt, response);
-                return new ToolExecutionOutcome(result, attempts, null);
+                T result = operation.get();
+                if (result == null) {
+                    throw new IllegalStateException("工具执行未返回结果");
+                }
+                return new ToolExecutionOutcome<>(result, attempts, null);
             } catch (RuntimeException exception) {
                 lastException = exception;
                 if (!isRetryableToolFailure(exception) || attempt >= MAX_TOOL_EXECUTION_ATTEMPTS) {
@@ -1554,7 +1535,7 @@ public class ChatServiceImpl implements ChatService {
                         attempt, MAX_TOOL_EXECUTION_ATTEMPTS, exception);
             }
         }
-        return new ToolExecutionOutcome(null, attempts, lastException);
+        return new ToolExecutionOutcome<>(null, attempts, lastException);
     }
 
     private static boolean isRetryableToolFailure(RuntimeException exception) {
@@ -1589,7 +1570,7 @@ public class ChatServiceImpl implements ChatService {
                         toolDisabled ? "TOOL" : "CALL",
                         resolveToolSafeMessage(exception, toolDisabled),
                         retryable,
-                        true
+                        retryable && attempts >= MAX_TOOL_EXECUTION_ATTEMPTS
                 ),
                 null
         );
@@ -1656,26 +1637,98 @@ public class ChatServiceImpl implements ChatService {
         };
     }
 
-    private ToolCallValidation validateToolCall(
-            List<org.springframework.ai.chat.messages.AssistantMessage.ToolCall> toolCalls,
-            int toolCallCount,
+    private DecisionValidation validateDecision(
+            ChatResponse response,
+            boolean articleSearchNeeded,
             Set<String> usedToolCalls,
             Set<String> disabledTools
     ) {
-        if (toolCalls == null
-                || toolCalls.size() != 1
-                || toolCallCount >= MAX_REACT_TOOL_CALLS) {
-            return new ToolCallValidation(null, null, "LIMIT_REACHED");
+        if (response == null || response.getResult() == null || response.getResult().getOutput() == null) {
+            return DecisionValidation.reject("EMPTY_DECISION_RESPONSE",
+                    "上一轮决策调用未返回有效响应，未执行工具。请发起原生工具调用或返回合法终态 JSON。");
         }
-        org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall = toolCalls.get(0);
-        if (disabledTools.contains(toolCall.name())) {
-            return new ToolCallValidation(null, null, "ERROR");
+        AssistantMessage output = response.getResult().getOutput();
+        if (response.hasToolCalls()) {
+            List<AssistantMessage.ToolCall> calls = output.getToolCalls();
+            if (calls == null || calls.size() != 1) {
+                return DecisionValidation.reject("INVALID_TOOL_CALL_COUNT",
+                        "本轮工具调用均未执行。每轮只能调用一个工具，请重新选择。");
+            }
+            AssistantMessage.ToolCall call = calls.get(0);
+            if (call == null || call.id() == null || call.id().isBlank()
+                    || call.name() == null || call.name().isBlank()) {
+                return DecisionValidation.reject("INVALID_TOOL_CALL",
+                        "工具调用未执行。请使用模型原生工具调用并提供有效调用 ID 和工具名称。");
+            }
+            boolean isArticleSearch = ARTICLE_SEARCH_TOOL_NAME.equals(call.name());
+            boolean isAuthorArticles = AuthorArticlesTool.TOOL_NAME.equals(call.name());
+            if (disabledTools.contains(call.name())
+                    || !(isAuthorArticles || (articleSearchNeeded && isArticleSearch))) {
+                return DecisionValidation.reject("TOOL_UNAVAILABLE",
+                        "工具 " + call.name() + " 当前未开放或已被禁用，本次未执行。"
+                                + "请选择可用工具，或根据已有信息作出终态决策。");
+            }
+
+            JsonNode arguments = parseJsonObject(call.arguments(), false);
+            if (arguments == null) {
+                return DecisionValidation.reject("INVALID_TOOL_ARGUMENTS",
+                        "工具参数必须是合法 JSON 对象。文章检索传入 query 字符串，作者文章查询传入 {}。");
+            }
+            if (isArticleSearch && (arguments.size() != 1
+                    || !arguments.path("query").isTextual()
+                    || arguments.path("query").asText().isBlank())) {
+                return DecisionValidation.reject("INVALID_TOOL_ARGUMENTS",
+                        "search_article_chunks 只接受一个非空字符串参数 query，例如 {\"query\":\"缺失证据\"}。");
+            }
+            if (isAuthorArticles && arguments.size() != 0) {
+                return DecisionValidation.reject("INVALID_TOOL_ARGUMENTS",
+                        "get_author_articles 的参数必须是 {}；作者身份由后端提供。");
+            }
+            String callKey = canonicalToolCallKey(call.name(), arguments.toString());
+            if (usedToolCalls.contains(callKey)) {
+                return DecisionValidation.reject("DUPLICATE_TOOL_CALL",
+                        "相同工具和参数已经调用过，本次未重复执行。请参考已有证据和观察记录，"
+                                + "根据缺失信息调整查询、换用可用工具或结束。");
+            }
+            return new DecisionValidation(call, callKey, null, null, null);
         }
-        String toolCallKey = canonicalToolCallKey(toolCall.name(), toolCall.arguments());
-        if (usedToolCalls.contains(toolCallKey)) {
-            return new ToolCallValidation(null, null, "ERROR");
+
+        JsonNode terminal = parseJsonObject(output.getText(), true);
+        if (terminal == null || !terminal.path("next_action").isTextual()) {
+            return DecisionValidation.reject("INVALID_TERMINAL_JSON",
+                    "请返回合法 JSON 对象，next_action 必须是 FINAL_ANSWER、ASK_USER 或 STOP 字符串。");
         }
-        return new ToolCallValidation(toolCall, toolCallKey, null);
+        var fieldNames = terminal.fieldNames();
+        while (fieldNames.hasNext()) {
+            String field = fieldNames.next();
+            if (!"next_action".equals(field) && !"user_question".equals(field)) {
+                return DecisionValidation.reject("INVALID_TERMINAL_FIELDS",
+                        "终态 JSON 只允许 next_action 和 user_question，不得输出或修改后端状态字段。");
+            }
+        }
+        String action = terminal.get("next_action").asText();
+        JsonNode questionNode = terminal.get("user_question");
+        String clarification = null;
+        switch (action) {
+            case "ASK_USER" -> {
+                if (questionNode == null || !questionNode.isTextual() || questionNode.asText().isBlank()) {
+                    return DecisionValidation.reject("MISSING_USER_QUESTION",
+                            "选择 ASK_USER 时，user_question 必须是具体、非空的追问字符串。");
+                }
+                clarification = questionNode.asText().trim();
+            }
+            case "FINAL_ANSWER", "STOP" -> {
+                if (questionNode != null && !questionNode.isNull()) {
+                    return DecisionValidation.reject("UNEXPECTED_USER_QUESTION",
+                            "选择 FINAL_ANSWER 或 STOP 时，user_question 应为 null。");
+                }
+            }
+            default -> {
+                return DecisionValidation.reject("INVALID_NEXT_ACTION",
+                        "next_action 只能是 FINAL_ANSWER、ASK_USER 或 STOP。");
+            }
+        }
+        return new DecisionValidation(null, null, new TerminalDecision(action, clarification), null, null);
     }
 
     private String canonicalToolCallKey(String toolName, String arguments) {
@@ -1787,19 +1840,22 @@ public class ChatServiceImpl implements ChatService {
         return 1;
     }
 
-    private TerminalDecision parseTerminalDecision(String content) {
+    private JsonNode parseJsonObject(String content, boolean allowCodeFence) {
         if (content == null || content.isBlank()) {
             return null;
         }
         String json = content.trim();
-        if (json.startsWith("```")) {
+        if (allowCodeFence && json.startsWith("```")) {
             json = json.replaceFirst("^```(?:json)?\\s*", "")
                     .replaceFirst("\\s*```$", "");
         }
         try {
-            return objectMapper.readValue(json, TerminalDecision.class);
+            JsonNode node = objectMapper.readerFor(JsonNode.class)
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .with(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY)
+                    .readValue(json);
+            return node != null && node.isObject() ? node : null;
         } catch (JsonProcessingException exception) {
-            log.warn("ReAct 终态决策无法解析: {}", content);
             return null;
         }
     }
@@ -1808,19 +1864,24 @@ public class ChatServiceImpl implements ChatService {
             Flux<String> response,
             Long conversationId,
             Integer version,
-            String question
+            String question,
+            List<Message> conversationMemory
     ) {
         StringBuilder answer = new StringBuilder();
-        AtomicBoolean saved = new AtomicBoolean(false);
+        AtomicBoolean sent = new AtomicBoolean(false);
         return response
                 .doOnNext(answer::append)
-                .doFinally(signalType -> {
-                    if (signalType == SignalType.ON_COMPLETE && saved.compareAndSet(false, true)) {
-                        chatMemory.add(
-                                String.valueOf(conversationId),
-                                List.of(
-                                        new Message(conversationId, version, "user", question),
-                                        new Message(conversationId, version, "assistant", answer.toString())
+                // 同步发送成功后才向下游传播完成信号，让 SSE 在发送结束后正常关闭。
+                .doOnComplete(() -> {
+                    if (sent.compareAndSet(false, true)) {
+                        rocketMQTemplate.syncSend(
+                                "get_long_memory",
+                                new MemoryUpdateMessage(
+                                        conversationId,
+                                        version,
+                                        question,
+                                        answer.toString(),
+                                        conversationMemory
                                 )
                         );
                     }
@@ -1835,7 +1896,8 @@ public class ChatServiceImpl implements ChatService {
             @JsonProperty("react_control") ReactControl reactControl,
             @JsonProperty("tool_control") ToolControl toolControl,
             List<Observation> observations,
-            List<Evidence> evidences
+            List<Evidence> evidences,
+            @JsonProperty("decision_rejections") List<DecisionRejection> decisionRejections
     ) {
     }
 
@@ -1863,6 +1925,10 @@ public class ChatServiceImpl implements ChatService {
             @JsonProperty("max_tool_calls") int maxToolCalls,
             @JsonProperty("visited_evidence_ids") List<String> visitedEvidenceIds,
             @JsonProperty("consecutive_no_new_evidence") int consecutiveNoNewEvidence,
+            @JsonProperty("max_consecutive_no_new_evidence") int maxConsecutiveNoNewEvidence,
+            // 连续未获得合法决策的次数，包含调用异常、空响应和校验失败。
+            @JsonProperty("consecutive_validation_failures") int consecutiveValidationFailures,
+            @JsonProperty("max_consecutive_validation_failures") int maxConsecutiveValidationFailures,
             @JsonProperty("stop_reason") String stopReason
     ) {
     }
@@ -1900,8 +1966,8 @@ public class ChatServiceImpl implements ChatService {
     ) {
     }
 
-    private record ToolExecutionOutcome(
-            ToolExecutionResult result,
+    private record ToolExecutionOutcome<T>(
+            T result,
             int attempts,
             RuntimeException exception
     ) {
@@ -1916,14 +1982,23 @@ public class ChatServiceImpl implements ChatService {
     ) {
     }
 
-    private record ToolCallValidation(
-            org.springframework.ai.chat.messages.AssistantMessage.ToolCall toolCall,
+    private record DecisionValidation(
+            AssistantMessage.ToolCall toolCall,
             String toolCallKey,
-            String stopReason
+            TerminalDecision terminalDecision,
+            String errorCode,
+            String feedback
     ) {
         private boolean accepted() {
-            return toolCall != null;
+            return errorCode == null;
         }
+
+        private static DecisionValidation reject(String errorCode, String feedback) {
+            return new DecisionValidation(null, null, null, errorCode, feedback);
+        }
+    }
+
+    private record DecisionRejection(int iteration, String code, String feedback) {
     }
 
     private record Evidence(

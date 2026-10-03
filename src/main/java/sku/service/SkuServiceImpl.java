@@ -2,6 +2,7 @@ package sku.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
@@ -9,7 +10,9 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.interceptor.TransactionAspectSupport;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import sku.model.Order;
 import sku.mq.CounterEvent;
+import sku.mq.OrderReservationStore;
 import sku.schema.CounterSchema;
 
 @Service
@@ -23,17 +26,27 @@ public class SkuServiceImpl implements SkuService {
     private static final long SEQUENCE_MASK = 0xFFFL;
     private static final int WORKER_ID_SHIFT = 12;
     private static final int TIMESTAMP_SHIFT = 22;
-    private static final long WORKER_ID = 0L;
-
     private final JdbcTemplate jdbcTemplate;
     private final ObjectMapper objectMapper;
+    private final OrderReservationStore reservations;
+    private final long workerId;
 
     private long lastTimestamp = -1L;
     private long sequence;
 
-    public SkuServiceImpl(JdbcTemplate jdbcTemplate, ObjectMapper objectMapper) {
+    public SkuServiceImpl(
+            JdbcTemplate jdbcTemplate,
+            ObjectMapper objectMapper,
+            OrderReservationStore reservations,
+            @Value("${sku.id.worker-id:0}") long workerId
+    ) {
+        if (workerId < 0 || workerId > 1023) {
+            throw new IllegalArgumentException("SKU worker id must be between 0 and 1023");
+        }
         this.jdbcTemplate = jdbcTemplate;
         this.objectMapper = objectMapper;
+        this.reservations = reservations;
+        this.workerId = workerId;
     }
 
     @Override
@@ -131,7 +144,7 @@ public class SkuServiceImpl implements SkuService {
 
         lastTimestamp = timestamp;
         return ((timestamp - SNOWFLAKE_EPOCH) << TIMESTAMP_SHIFT)
-                | (WORKER_ID << WORKER_ID_SHIFT)
+                | (workerId << WORKER_ID_SHIFT)
                 | sequence;
     }
 
@@ -141,5 +154,19 @@ public class SkuServiceImpl implements SkuService {
             current = System.currentTimeMillis();
         } while (current <= timestamp);
         return current;
+    }
+    /**
+     * Returns the accepted reservation ID, not a guarantee that MySQL has committed.
+     * The Redis script records the order event before this method returns; the
+     * stream relay owns delivery even if this process or the HTTP request fails.
+     */
+    @Override
+    public Long buy(Long skuId, Long userId) {
+        if (skuId == null || userId == null || skuId <= 0 || userId <= 0) {
+            return null;
+        }
+
+        long orderId = nextEventId();
+        return reservations.reserve(new Order(orderId, skuId, userId));
     }
 }

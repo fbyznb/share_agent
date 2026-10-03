@@ -1,5 +1,12 @@
 {
     "java.configuration.updateBuildConfiguration": "automatic",
-    "java.debug.settings.onBuildFailureProceed": true,
-    "java.compile.nullAnalysis.mode": "automatic"
+    "java.debug.settings.onBuildFailureProceed": false,
+    "java.debug.settings.forceBuildBeforeLaunch": true,
+    "java.autobuild.enabled": true,
+    "java.compile.nullAnalysis.mode": "automatic",
+    "maven.executable.path": "C:\\Users\\28252\\.m2\\wrapper\\dists\\apache-maven-3.9.9-bin\\6jahpldgeo6ddpe5aeei8sd838\\apache-maven-3.9.9\\bin\\mvn.cmd",
+    "terminal.integrated.env.windows": {
+        "JAVA_HOME": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.19.10-hotspot",
+        "PATH": "C:\\Program Files\\Eclipse Adoptium\\jdk-17.0.19.10-hotspot\\bin;C:\\Users\\28252\\.m2\\wrapper\\dists\\apache-maven-3.9.9-bin\\6jahpldgeo6ddpe5aeei8sd838\\apache-maven-3.9.9\\bin;${env:PATH}"
+    }
 }

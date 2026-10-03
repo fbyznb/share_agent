@@ -21,10 +21,13 @@ import org.springframework.jdbc.support.KeyHolder;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
+import org.springframework.util.Assert;
+import post.memory.SummarizingWindowChatMemory;
 import post.model.Message;
 
 import java.sql.PreparedStatement;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,7 +43,7 @@ import java.util.Map;
         consumeThreadMax = 64,
         maxReconsumeTimes = 3
 )
-public class GetLongMemory implements RocketMQListener<List<Message>> {
+public class GetLongMemory implements RocketMQListener<MemoryUpdateMessage> {
 
     private static final Logger logger = LoggerFactory.getLogger(GetLongMemory.class);
     private static final String SUMMARY_PREFIX = "以下是较早对话的摘要：";
@@ -78,6 +81,7 @@ public class GetLongMemory implements RocketMQListener<List<Message>> {
     private final ObjectMapper objectMapper;
     private final JdbcTemplate jdbcTemplate;
     private final TransactionTemplate transactionTemplate;
+    private final SummarizingWindowChatMemory chatMemory;
 
     private static final String MEMORY_CANDIDATE_EXTRACTOR_SYSTEM_PROMPT = """
             你是知识社区 Agent 的长期记忆候选抽取器。
@@ -909,17 +913,45 @@ public class GetLongMemory implements RocketMQListener<List<Message>> {
             VectorStore vectorStore,
             ObjectMapper objectMapper,
             JdbcTemplate jdbcTemplate,
-            PlatformTransactionManager transactionManager
+            PlatformTransactionManager transactionManager,
+            SummarizingWindowChatMemory chatMemory
     ) {
         this.chatClient = chatClient;
         this.vectorStore = vectorStore;
         this.objectMapper = objectMapper;
         this.jdbcTemplate = jdbcTemplate;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        this.chatMemory = chatMemory;
     }
 
     @Override
-    public void onMessage(List<Message> messages) {
+    public void onMessage(MemoryUpdateMessage memoryUpdate) {
+        Assert.notNull(memoryUpdate, "记忆更新消息不能为空");
+        Assert.notNull(memoryUpdate.conversationId(), "会话 ID 不能为空");
+        Assert.hasText(memoryUpdate.question(), "用户当前消息不能为空");
+        Assert.notNull(memoryUpdate.answer(), "助手回答不能为空");
+
+        Message userMessage = new Message(
+                memoryUpdate.conversationId(), memoryUpdate.version(), "user", memoryUpdate.question()
+        );
+        Message assistantMessage = new Message(
+                memoryUpdate.conversationId(), memoryUpdate.version(), "assistant", memoryUpdate.answer()
+        );
+
+        // 保留原有抽取上下文：历史快照和当前用户问题，不把本轮助手回答当作用户事实。
+        List<Message> longMemoryMessages = new ArrayList<>(memoryUpdate.conversationMemory());
+        longMemoryMessages.add(userMessage);
+        updateLongMemory(longMemoryMessages);
+
+        // 长期记忆处理成功后再追加本轮对话，避免抽取失败重试时重复保存对话。
+        // 消息追加与滚动摘要共用事务，摘要失败时一并回滚。
+        transactionTemplate.executeWithoutResult(status -> chatMemory.add(
+                String.valueOf(memoryUpdate.conversationId()),
+                List.of(userMessage, assistantMessage)
+        ));
+    }
+
+    private void updateLongMemory(List<Message> messages) {
         if (messages == null || messages.isEmpty()) {
             throw new IllegalArgumentException("长期记忆抽取消息不能为空");
         }
@@ -964,7 +996,7 @@ public class GetLongMemory implements RocketMQListener<List<Message>> {
                 recentConversation.isEmpty() ? "（无最近会话消息）" : recentConversation,
                 summary
         );
-
+        //1、提取长期记忆候选
         String candidates = chatClient.prompt()
                 .system(MEMORY_CANDIDATE_EXTRACTOR_SYSTEM_PROMPT)
                 .user(userPrompt)
@@ -991,7 +1023,7 @@ public class GetLongMemory implements RocketMQListener<List<Message>> {
         if (userId == null) {
             throw new IllegalStateException("会话未关联用户: " + currentMessage.getConversationId());
         }
-
+        //2、处理长期记忆候选
         FilterExpressionBuilder filterBuilder = new FilterExpressionBuilder();
         for (MemoryCandidate candidate : candidateResponse.candidates()) {
             if (candidate == null || candidate.memoryKey() == null

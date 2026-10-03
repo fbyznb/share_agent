@@ -164,32 +164,33 @@ public class MarkdownChunker {
                     currentChunk = startChunk(safeCandidate);
                     continue;
                 }
+                List<HeadingSegment> lastHeadingPath = currentSnapshot.lastHeadingPath();
+                List<HeadingSegment> candidateHeadingPath = safeCandidate.firstHeadingPath();
 
-                // Priority 2: 600 is allowed; only a result above it is forced apart.
-                int mergedTokenCount = estimate(currentSnapshot.text() + safeCandidate.text());
-                if (mergedTokenCount > MAX_TOKENS) {
+                // Priority 2: blocks on the same heading path merge up to the hard limit.
+                if (lastHeadingPath.equals(candidateHeadingPath)) {
+                    int mergedTokenCount = estimate(currentSnapshot.text() + safeCandidate.text());
+                    if (mergedTokenCount <= MAX_TOKENS) {
+                        currentSnapshot.add(safeCandidate);
+                        currentChunk = currentSnapshot;
+                    } else {
+                        chunks.add(currentSnapshot.toChunk());
+                        currentChunk = startChunk(safeCandidate);
+                    }
+                    continue;
+                }
+
+                // Priority 3: a heading-path change closes a chunk that has reached
+                // the hard minimum.
+                if (currentSnapshot.tokenCount() >= MIN_TOKENS) {
                     chunks.add(currentSnapshot.toChunk());
                     currentChunk = startChunk(safeCandidate);
                     continue;
                 }
 
-                // Priority 3: strong boundaries were handled by Priority 1. A
-                // sub-minimum chunk is merged even when a lower-level path changes.
-                if (currentSnapshot.tokenCount() < MIN_TOKENS) {
-                    currentSnapshot.add(safeCandidate);
-                    currentChunk = currentSnapshot;
-                    continue;
-                }
-
-                // Priority 4: reaching the target closes at this natural AST boundary.
-                if (currentSnapshot.tokenCount() >= TARGET_TOKENS) {
-                    chunks.add(currentSnapshot.toChunk());
-                    currentChunk = startChunk(safeCandidate);
-                    continue;
-                }
-
-                // Priorities 5 and 6: same exact path merges; a different path cuts.
-                if (currentSnapshot.lastHeadingPath().equals(safeCandidate.firstHeadingPath())) {
+                // Priority 4: a sub-minimum chunk crosses a heading-path boundary
+                // only when the two paths represent siblings or parent/child nodes.
+                if (areSiblingOrParentChild(lastHeadingPath, candidateHeadingPath)) {
                     currentSnapshot.add(safeCandidate);
                     currentChunk = currentSnapshot;
                 } else {
@@ -520,6 +521,28 @@ public class MarkdownChunker {
             }
         }
         return List.copyOf(path);
+    }
+
+    private static boolean areSiblingOrParentChild(
+            List<HeadingSegment> firstPath,
+            List<HeadingSegment> secondPath
+    ) {
+        if (isStrictPrefix(firstPath, secondPath) || isStrictPrefix(secondPath, firstPath)) {
+            return true;
+        }
+        if (firstPath.isEmpty() || firstPath.size() != secondPath.size()) {
+            return false;
+        }
+        return firstPath.subList(0, firstPath.size() - 1)
+                .equals(secondPath.subList(0, secondPath.size() - 1));
+    }
+
+    private static boolean isStrictPrefix(
+            List<HeadingSegment> possibleParent,
+            List<HeadingSegment> possibleChild
+    ) {
+        return possibleParent.size() < possibleChild.size()
+                && possibleParent.equals(possibleChild.subList(0, possibleParent.size()));
     }
 
     enum BlockType {

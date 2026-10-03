@@ -15,6 +15,7 @@ import org.springframework.ai.tool.annotation.ToolParam;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.filter.FilterExpressionBuilder;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -24,6 +25,9 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
 
 @Component
 public class ArticleSearchTool {
@@ -52,6 +56,7 @@ public class ArticleSearchTool {
     private final ElasticsearchClient elasticsearchClient;
     private final RerankModel rerankModel;
     private final ChatClient chatClient;
+    private final Executor articleSearchExecutor;
     private final String indexName;
 
     public ArticleSearchTool(
@@ -59,12 +64,14 @@ public class ArticleSearchTool {
             ElasticsearchClient elasticsearchClient,
             RerankModel rerankModel,
             ChatClient chatClient,
+            @Qualifier("articleSearchExecutor") Executor articleSearchExecutor,
             @Value("${spring.ai.vectorstore.elasticsearch.index-name}") String indexName
     ) {
         this.vectorStore = vectorStore;
         this.elasticsearchClient = elasticsearchClient;
         this.rerankModel = rerankModel;
         this.chatClient = chatClient;
+        this.articleSearchExecutor = articleSearchExecutor;
         this.indexName = indexName;
     }
 
@@ -119,53 +126,19 @@ public class ArticleSearchTool {
     ) {
         validateArguments(postId, version, semanticQuery, keywords);
 
-        FilterExpressionBuilder filterBuilder = new FilterExpressionBuilder();
-        List<Document> docs = vectorStore.similaritySearch(
-                SearchRequest.builder()
-                        .query(semanticQuery)
-                        .topK(40)
-                        .filterExpression(
-                                filterBuilder.and(
-                                        filterBuilder.eq("postId", postId),
-                                        filterBuilder.eq("version", version)
-                                ).build()
-                        )
-                        .build()
+        CompletableFuture<List<Document>> vectorFuture = CompletableFuture.supplyAsync(
+                () -> vectorRecall(postId, version, semanticQuery),
+                articleSearchExecutor
         );
-
+        //集合各个方法；记忆，分片，小麦平台；JVM，Spring，JUC，Redis，计网，线程和进程；SQL调优、CAS（悲观锁和乐观锁）、数据库锁、日志、RedisZset、索引、反射与Spring、分布式锁
         SearchResponse<Map> response;
         try {
-            response = elasticsearchClient.search(
-                    search -> search
-                            .index(indexName)
-                            .size(40)
-                            .query(queryBuilder -> queryBuilder
-                                    .bool(bool -> bool
-                                            .must(must -> must
-                                                    .match(match -> match
-                                                            .field("content")
-                                                            .query(keywords)
-                                                    )
-                                            )
-                                            .filter(filter -> filter
-                                                    .term(term -> term
-                                                            .field("metadata.postId")
-                                                            .value(FieldValue.of(postId))
-                                                    )
-                                            )
-                                            .filter(filter -> filter
-                                                    .term(term -> term
-                                                            .field("metadata.version")
-                                                            .value(FieldValue.of(version.longValue()))
-                                                    )
-                                            )
-                                    )
-                            ),
-                    Map.class
-            );
-        } catch (IOException exception) {
-            throw new IllegalStateException("文章 BM25 检索失败", exception);
+            response = bm25Recall(postId, version, keywords);
+        } catch (RuntimeException exception) {
+            vectorFuture.cancel(true);
+            throw exception;
         }
+        List<Document> docs = awaitVectorRecall(vectorFuture);
 
         final int rrfK = 60;
         Map<String, Double> rrfScores = new HashMap<>();
@@ -258,6 +231,87 @@ public class ArticleSearchTool {
             results.add(text);
         }
         return results;
+    }
+
+    private List<Document> vectorRecall(
+            Long postId,
+            Integer version,
+            String semanticQuery
+    ) {
+        FilterExpressionBuilder filterBuilder = new FilterExpressionBuilder();
+        return vectorStore.similaritySearch(
+                SearchRequest.builder()
+                        .query(semanticQuery)
+                        .topK(40)
+                        .filterExpression(
+                                filterBuilder.and(
+                                        filterBuilder.eq("postId", postId),
+                                        filterBuilder.eq("version", version)
+                                ).build()
+                        )
+                        .build()
+        );
+    }
+
+    @SuppressWarnings("rawtypes")
+    private SearchResponse<Map> bm25Recall(
+            Long postId,
+            Integer version,
+            String keywords
+    ) {
+        try {
+            return elasticsearchClient.search(
+                    search -> search
+                            .index(indexName)
+                            .size(40)
+                            .query(queryBuilder -> queryBuilder
+                                    .bool(bool -> bool
+                                            .must(must -> must
+                                                    .match(match -> match
+                                                            .field("content")
+                                                            .query(keywords)
+                                                    )
+                                            )
+                                            .filter(filter -> filter
+                                                    .term(term -> term
+                                                            .field("metadata.postId")
+                                                            .value(FieldValue.of(postId))
+                                                    )
+                                            )
+                                            .filter(filter -> filter
+                                                    .term(term -> term
+                                                            .field("metadata.version")
+                                                            .value(FieldValue.of(version.longValue()))
+                                                    )
+                                            )
+                                    )
+                            ),
+                    Map.class
+            );
+        } catch (IOException exception) {
+            throw new IllegalStateException("文章 BM25 检索失败", exception);
+        }
+    }
+
+    private static List<Document> awaitVectorRecall(
+            CompletableFuture<List<Document>> vectorFuture
+    ) {
+        try {
+            return vectorFuture.get();
+        } catch (InterruptedException exception) {
+            vectorFuture.cancel(true);
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("等待文章向量检索时被中断", exception);
+        } catch (ExecutionException exception) {
+            Throwable cause = exception.getCause();
+            if (cause instanceof RuntimeException runtimeException) {
+                throw runtimeException;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw new IllegalStateException("文章向量检索失败", cause);
+        }
     }
 
     private static Long requireLongContext(Map<String, Object> context, String key) {
